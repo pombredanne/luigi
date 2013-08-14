@@ -98,7 +98,7 @@ class RemoteContext(object):
 
 
 class RemoteFileSystem(luigi.target.FileSystem):
-    def __init__(self, host, username, key_file):
+    def __init__(self, host, username=None, key_file=None):
         self.remote_context = RemoteContext(host, username, key_file)
 
     def exists(self, path):
