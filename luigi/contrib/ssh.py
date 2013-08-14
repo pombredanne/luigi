@@ -12,7 +12,27 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
+"""
+Light-weight remote execution library and utilities
+
+There are some examples in the unittest, but I added another more luigi-specific in the examples directory (examples/ssh_remote_execution.py
+
+contrib.ssh.RemoteContext is meant to provide functionality similar to that of the standard library subprocess module, but where the commands executed are run on a remote machine instead, without the user having to think about prefixing everything with "ssh" and credentials etc.
+
+Using this mini library (which is just a convenience wrapper for subprocess),
+RemoteTarget is created to let you stream data from a remotely stored file using
+the luigi FileSystemTarget semantics.
+
+As a bonus, RemoteContext also provides a really cool feature that let's you
+set up ssh tunnels super easily using a python context manager (there is an example
+in the integration part of unittests).
+
+This can be super convenient when you want secure communication using a non-secure
+protocol or circumvent firewalls (as long as they are open for ssh traffic).
+"""
+
 import luigi
+import luigi.target
 import luigi.format
 import subprocess
 import contextlib
@@ -77,19 +97,14 @@ class RemoteContext(object):
         assert proc.returncode == 0, "Tunnel process did an unclean exit (returncode %s)" % (proc.returncode,)
 
 
-class RemoteTarget(luigi.Target):
-    """
-    Target used for reading from remote files. The target is implemented using
-    ssh commands streaming data over the network.
-    """
-    def __init__(self, path, host, format=None, username=None, key_file=None):
-        self.path = path
-        self.format = format
+class RemoteFileSystem(luigi.target.FileSystem):
+    def __init__(self, host, username, key_file):
         self.remote_context = RemoteContext(host, username, key_file)
 
-    def exists(self):
+    def exists(self, path):
+        """ Return `True` if file or directory at `path` exist, False otherwise """
         try:
-            self.remote_context.check_output(["test", "-e", self.path])
+            self.remote_context.check_output(["test", "-e", path])
         except subprocess.CalledProcessError, e:
             if e.returncode == 1:
                 return False
@@ -97,15 +112,36 @@ class RemoteTarget(luigi.Target):
                 raise
         return True
 
-    def remove(self):
-        self.remote_context.check_output(["rm", "-r", self.path])
+    def remove(self, path, recursive=True):
+        """ Remove file or directory at location `path` """
+        if recursive:
+            cmd = ["rm", "-r", path]
+        else:
+            cmd = ["rm", path]
+
+        self.remote_context.check_output(cmd)
+
+
+class RemoteTarget(luigi.target.FileSystemTarget):
+    """
+    Target used for reading from remote files. The target is implemented using
+    ssh commands streaming data over the network.
+    """
+    def __init__(self, path, host, format=None, username=None, key_file=None):
+        self.path = path
+        self.format = format
+        self._fs = RemoteFileSystem(host, username, key_file)
+
+    @property
+    def fs(self):
+        return self._fs
 
     def open(self, mode='r'):
         if mode == 'w':
             raise NotImplementedError("Writing to remote files it not yet implemented")
         elif mode == 'r':
             file_reader = luigi.format.InputPipeProcessWrapper(
-                self.remote_context._prepare_cmd(["cat", self.path]))
+                self.fs.remote_context._prepare_cmd(["cat", self.path]))
             if self.format:
                 return self.format.pipe_reader(file_reader)
             else:
