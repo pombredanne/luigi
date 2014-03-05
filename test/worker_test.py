@@ -17,8 +17,10 @@ from luigi.scheduler import CentralPlannerScheduler
 import luigi.worker
 from luigi.worker import Worker
 from luigi import Task, ExternalTask, RemoteScheduler
+from helpers import with_config
 import unittest
 import logging
+import threading
 import luigi.notifications
 luigi.notifications.DEBUG = True
 
@@ -32,7 +34,7 @@ class DummyTask(Task):
         return self.has_run
 
     def run(self):
-        logging.debug("%s - setting has_run" % self.task_id)
+        logging.debug("%s - setting has_run", self.task_id)
         self.has_run = True
 
 
@@ -246,6 +248,41 @@ class WorkerTest(unittest.TestCase):
         w.stop()
         w2.stop()
 
+    def test_interleaved_workers3(self):
+        class A(DummyTask):
+            def run(self):
+                logging.debug('running A')
+                time.sleep(0.1)
+                super(A, self).run()
+
+        a = A()
+
+        class B(DummyTask):
+            def requires(self):
+                return a
+            def run(self):
+                logging.debug('running B')
+                super(B, self).run()
+
+        b = B()
+
+        sch = CentralPlannerScheduler(retry_delay=100, remove_delay=1000, worker_disconnect_delay=10)
+
+        w  = Worker(scheduler=sch, worker_id='X', keep_alive=True)
+        w2 = Worker(scheduler=sch, worker_id='Y', keep_alive=True, wait_interval=0.1)
+
+        w.add(a)
+        w2.add(b)
+
+        threading.Thread(target=w.run).start()
+        w2.run()
+
+        self.assertTrue(a.complete())
+        self.assertTrue(b.complete())
+
+        w.stop()
+        w2.stop()
+
     def test_complete_exception(self):
         "Tests that a task is still scheduled if its sister task crashes in the complete() method"
         class A(DummyTask):
@@ -315,6 +352,8 @@ class WorkerPingThreadTests(unittest.TestCase):
         w.stop()  # should stop within 0.01 s
         self.assertFalse(w._keep_alive_thread.is_alive())
 
+EMAIL_CONFIG = {"core": {"error-email": "not-a-real-email-address-for-test-only"}}
+
 
 class EmailTest(unittest.TestCase):
     def setUp(self):
@@ -340,6 +379,7 @@ class WorkerEmailTest(EmailTest):
     def tearDown(self):
         self.worker.stop()
 
+    @with_config(EMAIL_CONFIG)
     def test_connection_error(self):
         sch = RemoteScheduler(host="this_host_doesnt_exist", port=1337)
         worker = Worker(scheduler=sch)
@@ -362,6 +402,7 @@ class WorkerEmailTest(EmailTest):
         self.assertEquals(self.last_email[0], "Luigi: Framework error while scheduling %s" % (a,))
         worker.stop()
 
+    @with_config(EMAIL_CONFIG)
     def test_complete_error(self):
         class A(DummyTask):
             def complete(self):
@@ -375,6 +416,7 @@ class WorkerEmailTest(EmailTest):
         self.assertEquals(("Luigi: %s failed scheduling" % (a,)), self.last_email[0])
         self.assertFalse(a.has_run)
 
+    @with_config(EMAIL_CONFIG)
     def test_complete_return_value(self):
         class A(DummyTask):
             def complete(self):
@@ -388,6 +430,7 @@ class WorkerEmailTest(EmailTest):
         self.assertEquals(("Luigi: %s failed scheduling" % (a,)), self.last_email[0])
         self.assertFalse(a.has_run)
 
+    @with_config(EMAIL_CONFIG)
     def test_run_error(self):
         class A(luigi.Task):
             def complete(self):

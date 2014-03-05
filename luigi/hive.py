@@ -273,8 +273,11 @@ class HiveQueryTask(luigi.hadoop.BaseHadoopJobTask):
         raise RuntimeError("Must implement query!")
 
     def hiverc(self):
-        """ Location of an rc file to run before the query """
-        return None
+        """ Location of an rc file to run before the query 
+            if hiverc-location key is specified in client.cfg, will default to the value there
+            otherwise returns None
+        """
+        return luigi.configuration.get_config().get('hive', 'hiverc-location', default=None)
 
     def hiveconfs(self):
         """
@@ -320,7 +323,7 @@ class HiveQueryRunner(luigi.hadoop.JobRunner):
             if isinstance(o, FileSystemTarget):
                 parent_dir = os.path.dirname(o.path)
                 if not o.fs.exists(parent_dir):
-                    logger.info("Creating parent directory %r" % (parent_dir,))
+                    logger.info("Creating parent directory %r", parent_dir)
                     try:
                         # there is a possible race condition
                         # which needs to be handled here
@@ -354,7 +357,7 @@ class HiveTableTarget(luigi.Target):
         self.client = client
 
     def exists(self):
-        logger.debug("Checking Hive table '{d}.{t}' exists".format(d=self.database, t=self.table))
+        logger.debug("Checking Hive table '%s.%s' exists", self.database, self.table)
         return self.client.table_exists(self.table, self.database)
 
     @property

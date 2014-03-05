@@ -19,6 +19,9 @@ import parameter
 import configuration
 import interface
 import target
+import worker
+
+Event = worker.Event
 
 Task = task.Task
 ExternalTask = task.ExternalTask
@@ -43,5 +46,6 @@ IntParameter = parameter.IntParameter
 FloatParameter = parameter.FloatParameter
 BooleanParameter = parameter.BooleanParameter
 DateIntervalParameter = parameter.DateIntervalParameter
+TimeDeltaParameter = parameter.TimeDeltaParameter
 
 namespace = task.namespace
