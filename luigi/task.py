@@ -79,8 +79,8 @@ class Register(abc.ABCMeta):
             classdict["task_namespace"] = metacls._default_namespace
 
         cls = super(Register, metacls).__new__(metacls, classname, bases, classdict)
-        if cls.run != NotImplemented:
-            metacls._reg.append(cls)
+        metacls._reg.append(cls)
+
         return cls
 
     def __call__(cls, *args, **kwargs):
@@ -140,14 +140,20 @@ class Register(abc.ABCMeta):
 
         :return:  a ``dict`` of task_family -> class
         """
+        # We have to do this on-demand in case task names have changed later
         reg = {}
         for cls in cls._reg:
-            name = cls.task_family
-            if name in reg and reg[name] != cls:
-                # Registering two different classes - this means we can't instantiate them by name
-                reg[name] = cls.AMBIGUOUS_CLASS
-            else:
-                reg[name] = cls
+            if cls.run != NotImplemented:
+                name = cls.task_family
+                if name in reg and reg[name] != cls and \
+                        reg[name] != cls.AMBIGUOUS_CLASS and \
+                        not issubclass(cls, reg[name]):
+                    # Registering two different classes - this means we can't instantiate them by name
+                    # The only exception is if one class is a subclass of the other. In that case, we
+                    # instantiate the most-derived class (this fixes some issues with decorator wrappers).
+                    reg[name] = cls.AMBIGUOUS_CLASS
+                else:
+                    reg[name] = cls
 
         return reg
 
@@ -158,8 +164,10 @@ class Register(abc.ABCMeta):
         :return: a ``dict`` of parameter name -> parameter.
         """
         global_params = {}
-        for cls in cls._reg:
-            for param_name, param_obj in cls.get_global_params():
+        for t_name, t_cls in cls.get_reg().iteritems():
+            if t_cls == cls.AMBIGUOUS_CLASS:
+                continue
+            for param_name, param_obj in t_cls.get_global_params():
                 if param_name in global_params and global_params[param_name] != param_obj:
                     # Could be registered multiple times in case there's subclasses
                     raise Exception('Global parameter %r registered by multiple classes' % param_name)
@@ -200,7 +208,6 @@ class Task(object):
       list of ``(parameter_name, parameter)`` tuples for this task class
     """
     __metaclass__ = Register
-
 
     _event_callbacks = {}
 
@@ -537,16 +544,16 @@ def getpaths(struct):
 
 
 def flatten(struct):
-    """Cleates a flat list of all all items in structured output (dicts, lists, items)
-    Examples::
+    """Creates a flat list of all all items in structured output (dicts, lists, items)
 
-        > _flatten({'a': foo, b: bar})
-        [foo, bar]
-        > _flatten([foo, [bar, troll]])
-        [foo, bar, troll]
-        > _flatten(foo)
-        [foo]
-
+    >>> flatten({'a': 'foo', 'b': 'bar'})
+    ['foo', 'bar']
+    >>> flatten(['foo', ['bar', 'troll']])
+    ['foo', 'bar', 'troll']
+    >>> flatten('foo')
+    ['foo']
+    >>> flatten(42)
+    [42]
     """
     if struct is None:
         return []
@@ -555,6 +562,8 @@ def flatten(struct):
         for key, result in struct.iteritems():
             flat += flatten(result)
         return flat
+    if isinstance(struct, basestring):
+        return [struct]
 
     try:
         # if iterable
