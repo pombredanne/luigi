@@ -19,7 +19,6 @@ import datetime
 import subprocess
 import tempfile
 from itertools import groupby
-from operator import itemgetter
 import pickle
 import binascii
 import logging
@@ -34,6 +33,7 @@ import configuration
 import warnings
 import mrrunner
 import json
+import glob
 
 logger = logging.getLogger('luigi-interface')
 
@@ -85,16 +85,25 @@ def create_packages_archive(packages, filename):
     def add(src, dst):
         logger.debug('adding to tar: %s -> %s', src, dst)
         tar.add(src, dst)
+
+    def add_files_for_package(sub_package_path, root_package_path, root_package_name):
+        for root, dirs, files in os.walk(sub_package_path):
+            if '.svn' in dirs:
+                dirs.remove('.svn')
+            for f in files:
+                if not f.endswith(".pyc") and not f.startswith("."):
+                    add(dereference(root + "/" + f), root.replace(root_package_path, root_package_name) + "/" + f)
+
     for package in packages:
         # Put a submodule's entire package in the archive. This is the
         # magic that usually packages everything you need without
         # having to attach packages/modules explicitly
-        if not hasattr(package, "__path__") and '.' in package.__name__:
+        if not getattr(package, "__path__", None) and '.' in package.__name__:
             package = __import__(package.__name__.rpartition('.')[0], None, None, 'non_empty')
 
         n = package.__name__.replace(".", "/")
 
-        if hasattr(package, "__path__"):
+        if getattr(package, "__path__", None):
             # TODO: (BUG) picking only the first path does not
             # properly deal with namespaced packages in different
             # directories
@@ -117,12 +126,17 @@ def create_packages_archive(packages, filename):
                     add(dereference(__import__(module_name, None, None, 'non_empty').__path__[0] + "/__init__.py"),
                         directory + "/__init__.py")
 
-                for root, dirs, files in os.walk(p):
-                    if '.svn' in dirs:
-                        dirs.remove('.svn')
-                    for f in files:
-                        if not f.endswith(".pyc") and not f.startswith("."):
-                            add(dereference(root + "/" + f), root.replace(p, n) + "/" + f)
+                add_files_for_package(p, p, n)
+
+                # include egg-info directories that are parallel:
+                for egg_info_path in glob.glob(p + '*.egg-info'):
+                    logger.debug(
+                        'Adding package metadata to archive for "%s" found at "%s"',
+                        package.__name__,
+                        egg_info_path
+                    )
+                    add_files_for_package(egg_info_path, p, n)
+
         else:
             f = package.__file__
             if f.endswith("pyc"):
@@ -217,16 +231,17 @@ def run_and_track_hadoop_job(arglist, tracking_url_callback=None, env=None):
                 err_line = err_line.strip()
                 if err_line:
                     logger.info('%s', err_line)
-                if err_line.find('Tracking URL') != -1:
-                    tracking_url = err_line.split('Tracking URL: ')[-1]
+                err_line = err_line.lower()
+                if err_line.find('tracking url') != -1:
+                    tracking_url = err_line.split('tracking url: ')[-1]
                     try:
                         tracking_url_callback(tracking_url)
                     except Exception as e:
                         logger.error("Error in tracking_url_callback, disabling! %s", e)
                         tracking_url_callback = lambda x: None
-                if err_line.find('Running job') != -1:
+                if err_line.find('running job') != -1:
                     # hadoop jar output
-                    job_id = err_line.split('Running job: ')[-1]
+                    job_id = err_line.split('running job: ')[-1]
                 if err_line.find('submitted hadoop job:') != -1:
                     # scalding output
                     job_id = err_line.split('submitted hadoop job: ')[-1]
@@ -357,13 +372,13 @@ class HadoopJobRunner(JobRunner):
         output_tmp_fn = output_final + '-temp-' + datetime.datetime.now().isoformat().replace(':', '-')
         tmp_target = luigi.hdfs.HdfsTarget(output_tmp_fn, is_tmp=True)
 
-        arglist = [luigi.hdfs.load_hadoop_cmd(), 'jar', self.streaming_jar]
+        arglist = luigi.hdfs.load_hadoop_cmd() + ['jar', self.streaming_jar]
 
         # 'libjars' is a generic option, so place it first
         libjars = [libjar for libjar in self.libjars]
 
         for libjar in self.libjars_in_hdfs:
-            subprocess.call([luigi.hdfs.load_hadoop_cmd(), 'fs', '-get', libjar, self.tmp_dir])
+            subprocess.call(luigi.hdfs.load_hadoop_cmd() + ['fs', '-get', libjar, self.tmp_dir])
             libjars.append(os.path.join(self.tmp_dir, os.path.basename(libjar)))
 
         if libjars:
@@ -408,10 +423,12 @@ class HadoopJobRunner(JobRunner):
             arglist += ['-inputformat', self.input_format]
 
         for target in luigi.task.flatten(job.input_hadoop()):
-            assert isinstance(target, luigi.hdfs.HdfsTarget)
+            if not isinstance(target, luigi.hdfs.HdfsTarget):
+                raise TypeError('target must be an HdfsTarget')
             arglist += ['-input', target.path]
 
-        assert isinstance(job.output(), luigi.hdfs.HdfsTarget)
+        if not isinstance(job.output(), luigi.hdfs.HdfsTarget):
+            raise TypeError('outout must be an HdfsTarget')
         arglist += ['-output', output_tmp_fn]
 
         # submit job
@@ -421,8 +438,7 @@ class HadoopJobRunner(JobRunner):
 
         run_and_track_hadoop_job(arglist)
 
-        # rename temporary work directory to given output
-        tmp_target.move(output_final, fail_if_exists=True)
+        tmp_target.move(output_final, raise_if_exists=True)
         self.finish()
 
     def finish(self):
@@ -487,6 +503,7 @@ class LocalJobRunner(JobRunner):
             map_output.close()
             return
 
+        job.init_mapper()
         # run job now...
         map_output = StringIO.StringIO()
         job._run_mapper(map_input, map_output)
@@ -501,6 +518,7 @@ class LocalJobRunner(JobRunner):
             combine_output.seek(0)
             reduce_input = self.group(combine_output)
 
+        job.init_reducer()
         reduce_output = job.output().open('w')
         job._run_reducer(reduce_input, reduce_output)
         reduce_output.close()
@@ -515,12 +533,16 @@ class BaseHadoopJobTask(luigi.Task):
     final_combiner = NotImplemented
     final_reducer = NotImplemented
 
+    mr_priority = NotImplemented
+
     _counter_dict = {}
     task_id = None
 
     def jobconfs(self):
         jcs = []
         jcs.append('mapred.job.name=%s' % self.task_id)
+        if self.mr_priority != NotImplemented:
+            jcs.append('mapred.job.priority=%s' % self.mr_priority())
         pool = self.pool
         if pool is not None:
             # Supporting two schedulers: fair (default) and capacity using the same option
@@ -752,8 +774,8 @@ class JobTask(BaseHadoopJobTask):
 
     def _reduce_input(self, inputs, reducer, final=NotImplemented):
         """Iterate over input, collect values with the same key, and call the reducer for each uniqe key."""
-        for key, values in groupby(inputs, itemgetter(0)):
-            for output in reducer(key, (v[1] for v in values)):
+        for key, values in groupby(inputs, key=lambda x: repr(x[0])):
+            for output in reducer(eval(key), (v[1] for v in values)):
                 yield output
         if final != NotImplemented:
             for output in final():

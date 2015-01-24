@@ -17,46 +17,62 @@ import os
 import os.path
 import random
 import tempfile
+import warnings
 import urlparse
 
-import boto
-from boto.s3.key import Key
-
 import configuration
-from ConfigParser import NoSectionError, NoOptionError
+from ConfigParser import NoSectionError
 from luigi.parameter import Parameter
 from luigi.target import FileSystem
 from luigi.target import FileSystemTarget
 from luigi.target import FileSystemException
 from luigi.task import ExternalTask
+from luigi.format import FileWrapper
+
+logger = logging.getLogger('luigi-interface')
+
+try:
+    import boto
+    from boto.s3.key import Key
+except ImportError:
+    logger.warning("Loading s3 module without boto installed. Will crash at "
+                   "runtime if s3 functionality is used.")
+
 
 # two different ways of marking a directory
 # with a suffix in S3
 S3_DIRECTORY_MARKER_SUFFIX_0 = '_$folder$'
 S3_DIRECTORY_MARKER_SUFFIX_1 = '/'
 
-logger = logging.getLogger('luigi-interface')
 
 class InvalidDeleteException(FileSystemException):
     pass
 
+
 class FileNotFoundException(FileSystemException):
     pass
+
 
 class S3Client(FileSystem):
     """
     boto-powered S3 client.
     """
 
-    def __init__(self, aws_access_key_id=None, aws_secret_access_key=None):
+    def __init__(self, aws_access_key_id=None, aws_secret_access_key=None,
+                 **kwargs):
+        options = self._get_s3_config()
+        options.update(kwargs)
+        # Removing key args would break backwards compability
         if not aws_access_key_id:
-            aws_access_key_id = self._get_s3_config('aws_access_key_id')
+            aws_access_key_id = options.get('aws_access_key_id')
         if not aws_secret_access_key:
-            aws_secret_access_key = self._get_s3_config('aws_secret_access_key')
-
+            aws_secret_access_key = options.get('aws_secret_access_key')
+        for key in ['aws_access_key_id', 'aws_secret_access_key']:
+            if key in options:
+                options.pop(key)
         self.s3 = boto.connect_s3(aws_access_key_id,
                                   aws_secret_access_key,
-                                  is_secure=True)
+                                  **options)
 
     def exists(self, path):
         """
@@ -78,10 +94,10 @@ class S3Client(FileSystem):
 
         if self.is_dir(path):
             return True
-        
+
         logger.debug('Path %s does not exist', path)
         return False
-    
+
     def remove(self, path, recursive=True):
         """
         Remove a file or directory from S3.
@@ -94,7 +110,8 @@ class S3Client(FileSystem):
 
         # root
         if self._is_root(key):
-            raise InvalidDeleteException('Cannot delete root of bucket at path %s' % path)
+            raise InvalidDeleteException(
+                'Cannot delete root of bucket at path %s' % path)
 
         # grab and validate the bucket
         s3_bucket = self.s3.get_bucket(bucket, validate=True)
@@ -107,16 +124,18 @@ class S3Client(FileSystem):
             return True
 
         if self.is_dir(path) and not recursive:
-            raise InvalidDeleteException('Path %s is a directory. Must use recursive delete' % path)
+            raise InvalidDeleteException(
+                'Path %s is a directory. Must use recursive delete' % path)
 
-        delete_key_list = [k for k in s3_bucket.list(self._add_path_delimiter(key))]
+        delete_key_list = [
+            k for k in s3_bucket.list(self._add_path_delimiter(key))]
 
         if len(delete_key_list) > 0:
             for k in delete_key_list:
                 logger.debug('Deleting %s from bucket %s', k, bucket)
             s3_bucket.delete_keys(delete_key_list)
             return True
-        
+
         return False
 
     def get_key(self, path):
@@ -139,6 +158,75 @@ class S3Client(FileSystem):
         s3_key = Key(s3_bucket)
         s3_key.key = key
         s3_key.set_contents_from_filename(local_path)
+
+    def put_string(self, content, destination_s3_path):
+        """
+        Put a string to an S3 path.
+        """
+        (bucket, key) = self._path_to_bucket_and_key(destination_s3_path)
+        # grab and validate the bucket
+        s3_bucket = self.s3.get_bucket(bucket, validate=True)
+        
+        # put the content
+        s3_key = Key(s3_bucket)
+        s3_key.key = key
+        s3_key.set_contents_from_string(content)
+
+    def put_multipart(self, local_path, destination_s3_path, part_size=67108864):
+        """
+        Put an object stored locally to an S3 path
+        using S3 multi-part upload (for files > 5GB).
+
+        :param local_path: Path to source local file
+        :param destination_s3_path: URL for target S3 location
+        :param part_size: Part size in bytes. Default: 67108864 (64MB), must be >= 5MB and <= 5 GB.
+        """
+        # calculate number of parts to upload
+        # based on the size of the file
+        source_size = os.stat(local_path).st_size
+
+        if source_size <= part_size:
+            # fallback to standard, non-multipart strategy
+            return self.put(local_path, destination_s3_path)
+
+        (bucket, key) = self._path_to_bucket_and_key(destination_s3_path)
+
+        # grab and validate the bucket
+        s3_bucket = self.s3.get_bucket(bucket, validate=True)
+
+        # calculate the number of parts (int division). 
+        # use modulo to avoid float precision issues
+        # for exactly-sized fits
+        num_parts = \
+            (source_size / part_size) \
+            if source_size % part_size == 0 \
+            else (source_size / part_size) + 1
+        
+        mp = None
+        try:
+            mp = s3_bucket.initiate_multipart_upload(key)
+
+            for i in xrange(num_parts):
+                # upload a part at a time to S3
+                offset = part_size * i
+                bytes = min(part_size, source_size - offset)
+                with open(local_path, 'rb') as fp:
+                    part_num = i+1
+                    logger.info('Uploading part %s/%s to %s' % \
+                        (part_num, num_parts, destination_s3_path))
+                    fp.seek(offset)
+                    mp.upload_part_from_file(fp, part_num=part_num, size=bytes)
+
+            # finish the upload, making the file available in S3
+            mp.complete_upload()
+        except:
+            if mp:
+                logger.info('Canceling multipart s3 upload for %s' %  destination_s3_path)
+                # cancel the upload so we don't get charged for
+                # storage consumed by uploaded parts
+                mp.cancel_upload()
+            raise
+
 
     def copy(self, source_path, destination_path):
         """
@@ -194,7 +282,8 @@ class S3Client(FileSystem):
         if self._is_root(key):
             return True
 
-        for suffix in (S3_DIRECTORY_MARKER_SUFFIX_0, S3_DIRECTORY_MARKER_SUFFIX_1):
+        for suffix in (S3_DIRECTORY_MARKER_SUFFIX_0,
+                       S3_DIRECTORY_MARKER_SUFFIX_1):
             s3_dir_with_suffix_key = s3_bucket.get_key(key + suffix)
             if s3_dir_with_suffix_key:
                 return True
@@ -203,20 +292,27 @@ class S3Client(FileSystem):
         key_path = self._add_path_delimiter(key)
         s3_bucket_list_result = \
             list(itertools.islice(
-                    s3_bucket.list(prefix=key_path),
+                 s3_bucket.list(prefix=key_path),
                  1))
         if s3_bucket_list_result:
             return True
 
         return False
 
-    def _get_s3_config(self, key):
+    def _get_s3_config(self, key=None):
         try:
-            return configuration.get_config().get('s3', key)
+            config = dict(configuration.get_config().items('s3'))
         except NoSectionError:
-            return None
-        except NoOptionError:
-            return None
+            return {}
+        # So what ports etc can be read without us having to specify all dtypes
+        for k, v in config.items():
+            try:
+                config[k] = int(v)
+            except ValueError:
+                pass
+        if key:
+            return config.get(key)
+        return config
 
     def _path_to_bucket_and_key(self, path):
         (scheme, netloc, path, query, fragment) = urlparse.urlsplit(path)
@@ -229,18 +325,19 @@ class S3Client(FileSystem):
     def _add_path_delimiter(self, key):
         return key if key[-1:] == '/' else key + '/'
 
+
 class AtomicS3File(file):
     """
     An S3 file that writes to a temp file and put to S3 on close.
     """
     def __init__(self, path, s3_client):
         self.__tmp_path = \
-            os.path.join(tempfile.gettempdir(), 
+            os.path.join(tempfile.gettempdir(),
                          'luigi-s3-tmp-%09d' % random.randrange(0, 1e10))
         self.path = path
         self.s3_client = s3_client
         super(AtomicS3File, self).__init__(self.__tmp_path, 'w')
-    
+
     def close(self):
         """
         Close the file.
@@ -248,8 +345,8 @@ class AtomicS3File(file):
         super(AtomicS3File, self).close()
 
         # store the contents in S3
-        self.s3_client.put(self.__tmp_path, self.path)
-    
+        self.s3_client.put_multipart(self.__tmp_path, self.path)
+
     def __del__(self):
         # remove the temporary directory
         if os.path.exists(self.__tmp_path):
@@ -260,6 +357,7 @@ class AtomicS3File(file):
         if exc_type:
             return
         return file.__exit__(self, exc_type, exc, traceback)
+
 
 class ReadableS3File(object):
 
@@ -278,33 +376,30 @@ class ReadableS3File(object):
 
     def __exit__(self, exc_type, exc, traceback):
         self.close()
-    
+
     def __enter__(self):
         return self
-    
-    def __exit__(self, type, value, traceback):
-        self.close()
-    
+
     def _add_to_buffer(self, line):
         self.buffer.append(line)
-    
+
     def _flush_buffer(self):
         output = ''.join(self.buffer)
         self.buffer = []
         return output
-    
+
     def __iter__(self):
         key_iter = self.s3_key.__iter__()
-        
+
         has_next = True
         while has_next:
             try:
                 # grab the next chunk
                 chunk = key_iter.next()
-                
+
                 # split on newlines, preserving the newline
                 for line in chunk.splitlines(True):
-                    
+
                     if not line.endswith(os.linesep):
                         # no newline, so store in buffer
                         self._add_to_buffer(line)
@@ -323,10 +418,11 @@ class ReadableS3File(object):
                 has_next = False
         self.close()
 
+
 class S3Target(FileSystemTarget):
     """
     """
-    
+
     fs = None
 
     def __init__(self, path, format=None, client=None):
@@ -343,36 +439,69 @@ class S3Target(FileSystemTarget):
         if mode == 'r':
             s3_key = self.fs.get_key(self.path)
             if s3_key:
-                return ReadableS3File(s3_key)
+                fileobj = ReadableS3File(s3_key)
+                if self.format:
+                    self._tmp_extract_path = tempfile.mktemp(
+                        prefix='luigi_s3_')
+                    with open(self._tmp_extract_path, 'w') as f:
+                        f.write(fileobj.read())
+                    try:
+                        with open(self._tmp_extract_path) as f:
+                            return self.format.pipe_reader(FileWrapper(f))
+                    finally:
+                        os.remove(self._tmp_extract_path)
+                return fileobj
             else:
-                raise FileNotFoundException("Could not find file at %s" % self.path)
+                raise FileNotFoundException(
+                    "Could not find file at %s" % self.path)
         else:
-            return AtomicS3File(self.path, self.fs)
+            if self.format:
+                return self.format.pipe_writer(
+                    AtomicS3File(self.path, self.fs))
+            else:
+                return AtomicS3File(self.path, self.fs)
 
-class S3EmrTarget(S3Target):
+
+class S3FlagTarget(S3Target):
     """
-    Defines a target directory for EMR output on S3
+    Defines a target directory with a flag-file (defaults to `_SUCCESS`) used
+    to signify job success.
 
-    This checks for two things:  that the path exists (just like the S3Target) and that the _SUCCESS file exists
-    within the directory.  Because Hadoop outputs into a directory and not a single file, the path is assume to be a
+    This checks for two things:  that the path exists (just like the S3Target)
+    and that the _SUCCESS file exists within the directory.  Because Hadoop
+    outputs into a directory and not a single file, the path is assume to be a
     directory.
 
-    This is meant to be a handy alternative to AtomicS3File.  The AtomicFile approach can be burdensome for S3 since
-    there are no directories, per se.  If we have 1,000,000 output files, then we have to rename 1,000,000 objects.
+    This is meant to be a handy alternative to AtomicS3File.  The AtomicFile
+    approach can be burdensome for S3 since there are no directories, per se.
+    If we have 1,000,000 output files, then we have to rename 1,000,000
+    objects.
     """
 
     fs = None
 
-    def __init__(self, path, format=None, client=None):
+    def __init__(self, path, format=None, client=None, flag='_SUCCESS'):
         if path[-1] is not "/":
-            raise ValueError("S3EmrTarget requires the path to be to a directory.  It must end with a slash ( / ).")
+            raise ValueError("S3FlagTarget requires the path to be to a "
+                             "directory.  It must end with a slash ( / ).")
         super(S3Target, self).__init__(path)
         self.format = format
         self.fs = client or S3Client()
+        self.flag = flag
 
     def exists(self):
-        hadoopSemaphore = self.path + '_SUCCESS'
+        hadoopSemaphore = self.path + self.flag
         return self.fs.exists(hadoopSemaphore)
+
+
+class S3EmrTarget(S3FlagTarget):
+    """
+    Deprecated. Use :py:class:`S3FlagTarget`
+    """
+    def __init__(self, *args, **kwargs):
+        warnings.warn("S3EmrTarget is deprecated. Please use S3FlagTarget")
+        super(S3EmrTarget, self).__init__(*args, **kwargs)
+
 
 class S3PathTask(ExternalTask):
     """
@@ -380,9 +509,10 @@ class S3PathTask(ExternalTask):
     a path in S3.
     """
     path = Parameter()
-        
+
     def output(self):
         return S3Target(self.path)
+
 
 class S3EmrTask(ExternalTask):
     """
@@ -392,3 +522,14 @@ class S3EmrTask(ExternalTask):
 
     def output(self):
         return S3EmrTarget(self.path)
+
+
+class S3FlagTask(ExternalTask):
+    """
+    An external task that requires the existence of EMR output in S3
+    """
+    path = Parameter()
+    flag = Parameter(default=None)
+
+    def output(self):
+        return S3FlagTarget(self.path, flag=self.flag)

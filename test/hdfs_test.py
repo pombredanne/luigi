@@ -14,35 +14,25 @@
 
 from calendar import timegm
 from datetime import datetime
-import getpass
-try:
-    import unittes2 as unittest
-except ImportError:
-    import unittest
 import luigi
 from luigi import hdfs
 import mock
 import re
+import functools
+from minicluster import MiniClusterTestCase
+from nose.plugins.attrib import attr
 
+try:
+    import unittest2 as unittest
+except ImportError:
+    import unittest
 
 class TestException(Exception):
     pass
 
 
-class HdfsTestCase(unittest.TestCase):
-    def setUp(self):
-        self.fs = hdfs.client
-
-    @staticmethod
-    def _test_dir():
-        return '/tmp/luigi_tmp_testdir_%s' % getpass.getuser()
-    
-    @staticmethod
-    def _test_file(suffix=""):
-        return '%s/luigi_tmp_testfile%s' % (HdfsTestCase._test_dir(), suffix)
-
-
-class ErrorHandling(HdfsTestCase):
+@attr('minicluster')
+class ErrorHandling(MiniClusterTestCase):
     def test_connection_refused(self):
         """ The point of this test is to see if file existence checks
         can distinguish file non-existence from errors
@@ -62,13 +52,14 @@ class ErrorHandling(HdfsTestCase):
         self.assertTrue(self.fs.exists(path))
         self.assertRaises(
             luigi.target.FileAlreadyExists,
-            self.fs.mkdir,
+            functools.partial(self.fs.mkdir, parents=False, raise_if_exists=True),
             path
         )
         self.fs.remove(path, skip_trash=True)
 
 
-class AtomicHdfsOutputPipeTests(HdfsTestCase):
+@attr('minicluster')
+class AtomicHdfsOutputPipeTests(MiniClusterTestCase):
     def test_atomicity(self):
         testpath = self._test_dir()
         if self.fs.exists(testpath):
@@ -110,7 +101,8 @@ class AtomicHdfsOutputPipeTests(HdfsTestCase):
         self.assertFalse(self.fs.exists(testpath))
 
 
-class HdfsAtomicWriteDirPipeTests(HdfsTestCase):
+@attr('minicluster')
+class HdfsAtomicWriteDirPipeTests(MiniClusterTestCase):
     def setUp(self):
         super(HdfsAtomicWriteDirPipeTests, self).setUp()
         self.path = self._test_file()
@@ -152,10 +144,12 @@ class HdfsAtomicWriteDirPipeTests(HdfsTestCase):
 
 
 # This class is a mixin, and does not inherit from TestCase, in order to avoid running the base class as a test case.
+@attr('minicluster')
 class _HdfsFormatTest(object):
     format = None  # override with luigi.format.Format subclass
 
     def setUp(self):
+        super(_HdfsFormatTest, self).setUp()
         self.target = hdfs.HdfsTarget(self._test_file(), format=self.format)
         if self.target.exists():
             self.target.remove(skip_trash=True)
@@ -175,11 +169,13 @@ class _HdfsFormatTest(object):
         self.assertFalse(self.target.exists())
 
 
-class PlainFormatTest(_HdfsFormatTest, HdfsTestCase):
+@attr('minicluster')
+class PlainFormatTest(_HdfsFormatTest, MiniClusterTestCase):
     format = hdfs.Plain
 
 
-class PlainDirFormatTest(_HdfsFormatTest, HdfsTestCase):
+@attr('minicluster')
+class PlainDirFormatTest(_HdfsFormatTest, MiniClusterTestCase):
     format = hdfs.PlainDir
 
     def test_multifile(self):
@@ -201,7 +197,8 @@ class PlainDirFormatTest(_HdfsFormatTest, HdfsTestCase):
         self.assertEqual(tuple(parts), ('bar', 'foo'))
 
 
-class HdfsTargetTests(HdfsTestCase):
+@attr('minicluster')
+class HdfsTargetTests(MiniClusterTestCase):
 
     def test_slow_exists(self):
         target = hdfs.HdfsTarget(self._test_file())
@@ -362,9 +359,60 @@ class HdfsTargetTests(HdfsTestCase):
         self.assertFalse(files.glob_exists(3))
         self.assertFalse(files.glob_exists(1))
 
+    def assertRegexpMatches(self, text, expected_regexp, msg=None):
+        """Python 2.7 backport."""
+        if isinstance(expected_regexp, basestring):
+            expected_regexp = re.compile(expected_regexp)
+        if not expected_regexp.search(text):
+            msg = msg or "Regexp didn't match"
+            msg = '%s: %r not found in %r' % (msg, expected_regexp.pattern, text)
+            raise self.failureException(msg)
+
+    def test_tmppath_not_configured(self):
+        #Given: several target paths to test
+        path1 = "/dir1/dir2/file"
+        path2 = "hdfs:///dir1/dir2/file"
+        path3 = "hdfs://somehost/dir1/dir2/file"
+        path4 = "file:///dir1/dir2/file"
+        path5 = "/tmp/dir/file"
+        path6 = "file:///tmp/dir/file"
+        path7 = "hdfs://somehost/tmp/dir/file"
+        path8 = None
+        path9 = "/tmpdir/file"
+
+        #When: I create a temporary path for targets
+        res1 = hdfs.tmppath(path1, include_unix_username=False)
+        res2 = hdfs.tmppath(path2, include_unix_username=False)
+        res3 = hdfs.tmppath(path3, include_unix_username=False)
+        res4 = hdfs.tmppath(path4, include_unix_username=False)
+        res5 = hdfs.tmppath(path5, include_unix_username=False)
+        res6 = hdfs.tmppath(path6, include_unix_username=False)
+        res7 = hdfs.tmppath(path7, include_unix_username=False)
+        res8 = hdfs.tmppath(path8, include_unix_username=False)
+        res9 = hdfs.tmppath(path9, include_unix_username=False)
+
+        #Then: I should get correct results relative to Luigi temporary directory
+        self.assertRegexpMatches(res1,"^/tmp/dir1/dir2/file-luigitemp-\d+")
+        #it would be better to see hdfs:///path instead of hdfs:/path, but single slash also works well
+        self.assertRegexpMatches(res2, "^hdfs:/tmp/dir1/dir2/file-luigitemp-\d+")
+        self.assertRegexpMatches(res3, "^hdfs://somehost/tmp/dir1/dir2/file-luigitemp-\d+")
+        self.assertRegexpMatches(res4, "^file:///tmp/dir1/dir2/file-luigitemp-\d+")
+        self.assertRegexpMatches(res5, "^/tmp/dir/file-luigitemp-\d+")
+        #known issue with duplicated "tmp" if schema is present
+        self.assertRegexpMatches(res6, "^file:///tmp/tmp/dir/file-luigitemp-\d+")
+        #known issue with duplicated "tmp" if schema is present
+        self.assertRegexpMatches(res7, "^hdfs://somehost/tmp/tmp/dir/file-luigitemp-\d+")
+        self.assertRegexpMatches(res8, "^/tmp/luigitemp-\d+")
+        self.assertRegexpMatches(res9,  "/tmp/tmpdir/file")
+
+    def test_tmppath_username(self):
+        self.assertRegexpMatches(hdfs.tmppath('/path/to/stuff', include_unix_username=True),
+                                 "^/tmp/[a-z0-9_]+/path/to/stuff-luigitemp-\d+")
+
 
 TIMESTAMP_DELAY = 60 # Big enough for `hadoop fs`?
-class _HdfsClientTest(HdfsTestCase):
+@attr('minicluster')
+class _HdfsClientTest(MiniClusterTestCase):
 
     def create_file(self, target):
         fobj = target.open("w")
@@ -488,11 +536,11 @@ class _HdfsClientTest(HdfsTestCase):
                                   include_type=False, include_time=False,
                                   recursive=False)
         entries = [dd for dd in dirlist]
-        self.assertEquals(4, len(entries), msg="%r" % entries)
-        self.assertEquals(path + '/file1.dat', entries[0], msg="%r" % entries)
-        self.assertEquals(path + '/file2.dat', entries[1], msg="%r" % entries)
-        self.assertEquals(path + '/sub1', entries[2], msg="%r" % entries)
-        self.assertEquals(path + '/sub2', entries[3], msg="%r" % entries)
+        self.assertEqual(4, len(entries), msg="%r" % entries)
+        self.assertEqual(path + '/file1.dat', entries[0], msg="%r" % entries)
+        self.assertEqual(path + '/file2.dat', entries[1], msg="%r" % entries)
+        self.assertEqual(path + '/sub1', entries[2], msg="%r" % entries)
+        self.assertEqual(path + '/sub2', entries[3], msg="%r" % entries)
 
     def test_listdir_base_list_files_only(self):
         """Verify we get the base two files created by _setup_listdir()"""
@@ -502,9 +550,9 @@ class _HdfsClientTest(HdfsTestCase):
                                   include_type=False, include_time=False,
                                   recursive=False)
         entries = [dd for dd in dirlist]
-        self.assertEquals(2, len(entries), msg="%r" % entries)
-        self.assertEquals(path + '/file1.dat', entries[0], msg="%r" % entries)
-        self.assertEquals(path + '/file2.dat', entries[1], msg="%r" % entries)
+        self.assertEqual(2, len(entries), msg="%r" % entries)
+        self.assertEqual(path + '/file1.dat', entries[0], msg="%r" % entries)
+        self.assertEqual(path + '/file2.dat', entries[1], msg="%r" % entries)
 
     def test_listdir_base_list_dirs_only(self):
         """Verify we get the base two directories created by _setup_listdir()"""
@@ -514,9 +562,9 @@ class _HdfsClientTest(HdfsTestCase):
                                   include_type=False, include_time=False,
                                   recursive=False)
         entries = [dd for dd in dirlist]
-        self.assertEquals(2, len(entries), msg="%r" % entries)
-        self.assertEquals(path + '/sub1', entries[0], msg="%r" % entries)
-        self.assertEquals(path + '/sub2', entries[1], msg="%r" % entries)
+        self.assertEqual(2, len(entries), msg="%r" % entries)
+        self.assertEqual(path + '/sub1', entries[0], msg="%r" % entries)
+        self.assertEqual(path + '/sub2', entries[1], msg="%r" % entries)
 
     def test_listdir_base_list_recusion(self):
         """Verify we get the every item created by _setup_listdir()"""
@@ -526,13 +574,13 @@ class _HdfsClientTest(HdfsTestCase):
                                   include_type=False, include_time=False,
                                   recursive=True)
         entries = [dd for dd in dirlist]
-        self.assertEquals(6, len(entries), msg="%r" % entries)
-        self.assertEquals(path + '/file1.dat', entries[0], msg="%r" % entries)
-        self.assertEquals(path + '/file2.dat', entries[1], msg="%r" % entries)
-        self.assertEquals(path + '/sub1', entries[2], msg="%r" % entries)
-        self.assertEquals(path + '/sub1/file3.dat', entries[3], msg="%r" % entries)
-        self.assertEquals(path + '/sub2', entries[4], msg="%r" % entries)
-        self.assertEquals(path + '/sub2/file4.dat', entries[5], msg="%r" % entries)
+        self.assertEqual(6, len(entries), msg="%r" % entries)
+        self.assertEqual(path + '/file1.dat', entries[0], msg="%r" % entries)
+        self.assertEqual(path + '/file2.dat', entries[1], msg="%r" % entries)
+        self.assertEqual(path + '/sub1', entries[2], msg="%r" % entries)
+        self.assertEqual(path + '/sub1/file3.dat', entries[3], msg="%r" % entries)
+        self.assertEqual(path + '/sub2', entries[4], msg="%r" % entries)
+        self.assertEqual(path + '/sub2/file4.dat', entries[5], msg="%r" % entries)
 
     def test_listdir_base_list_get_sizes(self):
         """Verify we get sizes for the two base files."""
@@ -542,13 +590,13 @@ class _HdfsClientTest(HdfsTestCase):
                                   include_type=False, include_time=False,
                                   recursive=False)
         entries = [dd for dd in dirlist]
-        self.assertEquals(4, len(entries), msg="%r" % entries)
-        self.assertEquals(2, len(entries[0]), msg="%r" % entries)
-        self.assertEquals(path + '/file1.dat', entries[0][0], msg="%r" % entries)
-        self.assertEquals(0, entries[0][1], msg="%r" % entries)
-        self.assertEquals(2, len(entries[1]), msg="%r" % entries)
-        self.assertEquals(path + '/file2.dat', entries[1][0], msg="%r" % entries)
-        self.assertEquals(0, entries[1][1], msg="%r" % entries)
+        self.assertEqual(4, len(entries), msg="%r" % entries)
+        self.assertEqual(2, len(entries[0]), msg="%r" % entries)
+        self.assertEqual(path + '/file1.dat', entries[0][0], msg="%r" % entries)
+        self.assertEqual(0, entries[0][1], msg="%r" % entries)
+        self.assertEqual(2, len(entries[1]), msg="%r" % entries)
+        self.assertEqual(path + '/file2.dat', entries[1][0], msg="%r" % entries)
+        self.assertEqual(0, entries[1][1], msg="%r" % entries)
 
     def test_listdir_base_list_get_types(self):
         """Verify we get the types for the four base items."""
@@ -558,19 +606,19 @@ class _HdfsClientTest(HdfsTestCase):
                                   include_type=True, include_time=False,
                                   recursive=False)
         entries = [dd for dd in dirlist]
-        self.assertEquals(4, len(entries), msg="%r" % entries)
-        self.assertEquals(2, len(entries[0]), msg="%r" % entries)
-        self.assertEquals(path + '/file1.dat', entries[0][0], msg="%r" % entries)
+        self.assertEqual(4, len(entries), msg="%r" % entries)
+        self.assertEqual(2, len(entries[0]), msg="%r" % entries)
+        self.assertEqual(path + '/file1.dat', entries[0][0], msg="%r" % entries)
         self.assertTrue(re.match(r'[-f]', entries[0][1]), msg="%r" % entries)
-        self.assertEquals(2, len(entries[1]), msg="%r" % entries)
-        self.assertEquals(path + '/file2.dat', entries[1][0], msg="%r" % entries)
+        self.assertEqual(2, len(entries[1]), msg="%r" % entries)
+        self.assertEqual(path + '/file2.dat', entries[1][0], msg="%r" % entries)
         self.assertTrue(re.match(r'[-f]', entries[1][1]), msg="%r" % entries)
-        self.assertEquals(2, len(entries[2]), msg="%r" % entries)
-        self.assertEquals(path + '/sub1', entries[2][0], msg="%r" % entries)
-        self.assertEquals('d', entries[2][1], msg="%r" % entries)
-        self.assertEquals(2, len(entries[3]), msg="%r" % entries)
-        self.assertEquals(path + '/sub2', entries[3][0], msg="%r" % entries)
-        self.assertEquals('d', entries[3][1], msg="%r" % entries)
+        self.assertEqual(2, len(entries[2]), msg="%r" % entries)
+        self.assertEqual(path + '/sub1', entries[2][0], msg="%r" % entries)
+        self.assertEqual('d', entries[2][1], msg="%r" % entries)
+        self.assertEqual(2, len(entries[3]), msg="%r" % entries)
+        self.assertEqual(path + '/sub2', entries[3][0], msg="%r" % entries)
+        self.assertEqual('d', entries[3][1], msg="%r" % entries)
 
     def test_listdir_base_list_get_times(self):
         """Verify we get the times, even if we can't fully check them."""
@@ -580,9 +628,9 @@ class _HdfsClientTest(HdfsTestCase):
                                   include_type=False, include_time=True,
                                   recursive=False)
         entries = [dd for dd in dirlist]
-        self.assertEquals(4, len(entries), msg="%r" % entries)
-        self.assertEquals(2, len(entries[0]), msg="%r" % entries)
-        self.assertEquals(path + '/file1.dat', entries[0][0], msg="%r" % entries)
+        self.assertEqual(4, len(entries), msg="%r" % entries)
+        self.assertEqual(2, len(entries[0]), msg="%r" % entries)
+        self.assertEqual(path + '/file1.dat', entries[0][0], msg="%r" % entries)
         self.assertTrue(timegm(datetime.now().timetuple()) -
                         timegm(entries[0][1].timetuple()) < TIMESTAMP_DELAY) 
 
@@ -594,23 +642,23 @@ class _HdfsClientTest(HdfsTestCase):
                                   include_type=True, include_time=True,
                                   recursive=True)
         entries = [dd for dd in dirlist]
-        self.assertEquals(6, len(entries), msg="%r" % entries)
-        self.assertEquals(4, len(entries[0]), msg="%r" % entries)
-        self.assertEquals(path + '/file1.dat', entries[0][0], msg="%r" % entries)
-        self.assertEquals(0, entries[0][1], msg="%r" % entries)
+        self.assertEqual(6, len(entries), msg="%r" % entries)
+        self.assertEqual(4, len(entries[0]), msg="%r" % entries)
+        self.assertEqual(path + '/file1.dat', entries[0][0], msg="%r" % entries)
+        self.assertEqual(0, entries[0][1], msg="%r" % entries)
         self.assertTrue(re.match(r'[-f]', entries[0][2]), msg="%r" % entries)
         self.assertTrue(timegm(datetime.now().timetuple()) -
                         timegm(entries[0][3].timetuple()) < TIMESTAMP_DELAY)
-        self.assertEquals(4, len(entries[1]), msg="%r" % entries)
-        self.assertEquals(path + '/file2.dat', entries[1][0], msg="%r" % entries)
-        self.assertEquals(4, len(entries[2]), msg="%r" % entries)
-        self.assertEquals(path + '/sub1', entries[2][0], msg="%r" % entries)
-        self.assertEquals(4, len(entries[3]), msg="%r" % entries)
-        self.assertEquals(path + '/sub1/file3.dat', entries[3][0], msg="%r" % entries)
-        self.assertEquals(4, len(entries[4]), msg="%r" % entries)
-        self.assertEquals(path + '/sub2', entries[4][0], msg="%r" % entries)
-        self.assertEquals(4, len(entries[5]), msg="%r" % entries)
-        self.assertEquals(path + '/sub2/file4.dat', entries[5][0], msg="%r" % entries)
+        self.assertEqual(4, len(entries[1]), msg="%r" % entries)
+        self.assertEqual(path + '/file2.dat', entries[1][0], msg="%r" % entries)
+        self.assertEqual(4, len(entries[2]), msg="%r" % entries)
+        self.assertEqual(path + '/sub1', entries[2][0], msg="%r" % entries)
+        self.assertEqual(4, len(entries[3]), msg="%r" % entries)
+        self.assertEqual(path + '/sub1/file3.dat', entries[3][0], msg="%r" % entries)
+        self.assertEqual(4, len(entries[4]), msg="%r" % entries)
+        self.assertEqual(path + '/sub2', entries[4][0], msg="%r" % entries)
+        self.assertEqual(4, len(entries[5]), msg="%r" % entries)
+        self.assertEqual(path + '/sub2/file4.dat', entries[5][0], msg="%r" % entries)
 
     @mock.patch('luigi.hdfs.call_check')
     def test_cdh3_client(self, call_check):
@@ -619,7 +667,7 @@ class _HdfsClientTest(HdfsTestCase):
         call_check.assert_called_once_with(['hadoop', 'fs', '-rmr', '/some/path/here'])
 
         cdh3_client.remove("/some/path/here", recursive=False)
-        self.assertEquals(mock.call(['hadoop', 'fs', '-rm', '/some/path/here']), call_check.call_args_list[-1])
+        self.assertEqual(mock.call(['hadoop', 'fs', '-rm', '/some/path/here']), call_check.call_args_list[-1])
 
     @mock.patch('subprocess.Popen')
     def test_apache1_client(self, popen):
@@ -644,3 +692,11 @@ class _HdfsClientTest(HdfsTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+    # Uncomment to run a single test
+    # unittest.TextTestRunner(failfast=True, verbosity=2).run(suite())
+
+# def suite():
+#     suite = unittest.TestSuite()
+#     suite.addTest(unittest.makeSuite(HdfsTargetTests, prefix='test_tmppath'))
+#     return suite
+

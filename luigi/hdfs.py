@@ -15,14 +15,16 @@
 import subprocess
 import os
 import random
-import tempfile
 import urlparse
 import luigi.format
+import luigi.contrib.target
 import datetime
 import re
+import warnings
 from luigi.target import FileSystem, FileSystemTarget, FileAlreadyExists
 import configuration
 import logging
+import getpass
 logger = logging.getLogger('luigi-interface')
 
 
@@ -48,37 +50,53 @@ def call_check(command):
     return stdout
 
 
-def get_hdfs_syntax():
-    """
-    CDH4 (hadoop 2+) has a slightly different syntax for interacting with
-    hdfs via the command line. The default version is CDH4, but one can
-    override this setting with "cdh3" or "apache1" in the hadoop section of the config in
-    order to use the old syntax
-    """
-    config = configuration.get_config()
-    if config.getboolean("hdfs", "use_snakebite", False):
-        return "snakebite"
-    return config.get("hadoop", "version", "cdh4").lower()
-
-
 def load_hadoop_cmd():
-    return luigi.configuration.get_config().get('hadoop', 'command', 'hadoop')
+    return [luigi.configuration.get_config().get('hadoop', 'command', 'hadoop')]
 
 
-def tmppath(path=None):
-    # No /tmp//tmp/luigi_tmp_testdir sorts of paths just /tmp/luigi_tmp_testdir.
-    hdfs_tmp_dir = configuration.get_config().get('core', 'hdfs-tmp-dir', None)
-    if hdfs_tmp_dir is not None:
-        base = hdfs_tmp_dir
-    elif path is not None and path.startswith(tempfile.gettempdir()):
-        base = ''
+def tmppath(path=None, include_unix_username=True):
+    """
+    @param path: target path for which it is needed to generate temporary location
+    @type path: str
+    @type include_unix_username: bool
+    @rtype: str
+
+    Note that include_unix_username might work on windows too.
+    """
+    addon = "luigitemp-%08d" % random.randrange(1e9)
+    temp_dir = '/tmp'  # default tmp dir if none is specified in config
+
+    #1. Figure out to which temporary directory to place
+    configured_hdfs_tmp_dir = configuration.get_config().get('core', 'hdfs-tmp-dir', None)
+    if configured_hdfs_tmp_dir is not None:
+        #config is superior
+        base_dir = configured_hdfs_tmp_dir
+    elif path is not None:
+        #need to copy correct schema and network location
+        parsed = urlparse.urlparse(path)
+        base_dir = urlparse.urlunparse((parsed.scheme, parsed.netloc, temp_dir, '', '', ''))
     else:
-        base = tempfile.gettempdir()
-    if path is not None and path.startswith('/'):
-        sep = ''
+        #just system temporary directory
+        base_dir = temp_dir
+
+    #2. Figure out what to place
+    if path is not None:
+        if path.startswith(temp_dir + '/'):
+            #Not 100%, but some protection from directories like /tmp/tmp/file
+            subdir = path[len(temp_dir):]
+        else:
+            #Protection from /tmp/hdfs:/dir/file
+            parsed = urlparse.urlparse(path)
+            subdir = parsed.path
+        subdir = subdir.lstrip('/') + '-'
     else:
-        sep = '/'
-    return base + sep + (path + "-" if path else "") + "luigitemp-%08d" % random.randrange(1e9)
+        #just return any random temporary location
+        subdir = ''
+
+    if include_unix_username:
+        subdir = os.path.join(getpass.getuser(), subdir)
+
+    return os.path.join(base_dir, subdir + addon)
 
 def list_path(path):
     if isinstance(path, list) or isinstance(path, tuple):
@@ -96,7 +114,8 @@ class HdfsClient(FileSystem):
         """ Use ``hadoop fs -stat`` to check file existence
         """
 
-        cmd = [load_hadoop_cmd(), 'fs', '-stat', path]
+        cmd = load_hadoop_cmd() + ['fs', '-stat', path]
+        logger.debug('Running file existence check: %s' % u' '.join(cmd))
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True)
         stdout, stderr = p.communicate()
         if p.returncode == 0:
@@ -116,15 +135,14 @@ class HdfsClient(FileSystem):
         if type(path) not in (list, tuple):
             path = [path]
         else:
-            import warnings
             warnings.warn("Renaming multiple files at once is not atomic.")
-        call_check([load_hadoop_cmd(), 'fs', '-mv'] + path + [dest])
+        call_check(load_hadoop_cmd() + ['fs', '-mv'] + path + [dest])
 
     def remove(self, path, recursive=True, skip_trash=False):
         if recursive:
-            cmd = [load_hadoop_cmd(), 'fs', '-rm', '-r']
+            cmd = load_hadoop_cmd() + ['fs', '-rm', '-r']
         else:
-            cmd = [load_hadoop_cmd(), 'fs', '-rm']
+            cmd = load_hadoop_cmd() + ['fs', '-rm']
 
         if skip_trash:
             cmd = cmd + ['-skipTrash']
@@ -134,9 +152,9 @@ class HdfsClient(FileSystem):
 
     def chmod(self, path, permissions, recursive=False):
         if recursive:
-            cmd = [load_hadoop_cmd(), 'fs', '-chmod', '-R', permissions, path]
+            cmd = load_hadoop_cmd() + ['fs', '-chmod', '-R', permissions, path]
         else:
-            cmd = [load_hadoop_cmd(), 'fs', '-chmod', permissions, path]
+            cmd = load_hadoop_cmd() + ['fs', '-chmod', permissions, path]
         call_check(cmd)
 
     def chown(self, path, owner, group, recursive=False):
@@ -146,40 +164,51 @@ class HdfsClient(FileSystem):
             group = ''
         ownership = "%s:%s" % (owner, group)
         if recursive:
-            cmd = [load_hadoop_cmd(), 'fs', '-chown', '-R', ownership, path]
+            cmd = load_hadoop_cmd() + ['fs', '-chown', '-R', ownership, path]
         else:
-            cmd = [load_hadoop_cmd(), 'fs', '-chown', ownership, path]
+            cmd = load_hadoop_cmd() + ['fs', '-chown', ownership, path]
         call_check(cmd)
 
     def count(self, path):
-        cmd = [load_hadoop_cmd(), 'fs', '-count', path]
+        cmd = load_hadoop_cmd() + ['fs', '-count', path]
         stdout = call_check(cmd)
-        (dir_count, file_count, content_size, ppath) = stdout.split()
+        lines = stdout.split('\n')
+        for line in stdout.split('\n'):
+            if line.startswith("OpenJDK 64-Bit Server VM warning") or line.startswith("It's highly recommended") or not line:
+                lines.pop(lines.index(line))
+            else:
+               (dir_count, file_count, content_size, ppath) = stdout.split() 
         results = {'content_size': content_size, 'dir_count': dir_count, 'file_count': file_count}
         return results
 
     def copy(self, path, destination):
-        call_check([load_hadoop_cmd(), 'fs', '-cp', path, destination])
+        call_check(load_hadoop_cmd() + ['fs', '-cp', path, destination])
 
     def put(self, local_path, destination):
-        call_check([load_hadoop_cmd(), 'fs', '-put', local_path, destination])
+        call_check(load_hadoop_cmd() + ['fs', '-put', local_path, destination])
 
     def get(self, path, local_destination):
-        call_check([load_hadoop_cmd(), 'fs', '-get', path, local_destination])
+        call_check(load_hadoop_cmd() + ['fs', '-get', path, local_destination])
 
     def getmerge(self, path, local_destination, new_line=False):
         if new_line:
-            cmd = [load_hadoop_cmd(), 'fs', '-getmerge', '-nl', path, local_destination]
+            cmd = load_hadoop_cmd() + ['fs', '-getmerge', '-nl', path, local_destination]
         else:
-            cmd = [load_hadoop_cmd(), 'fs', '-getmerge', path, local_destination]
+            cmd = load_hadoop_cmd() + ['fs', '-getmerge', path, local_destination]
         call_check(cmd)
 
-    def mkdir(self, path):
+    def mkdir(self, path, parents=True, raise_if_exists=False):
+        if (parents and raise_if_exists):
+            raise NotImplementedError("HdfsClient.mkdir can't raise with -p")
         try:
-            call_check([load_hadoop_cmd(), 'fs', '-mkdir', '-p', path])
+            cmd = (load_hadoop_cmd() + ['fs', '-mkdir'] +
+                   (['-p'] if parents else []) +
+                   [path])
+            call_check(cmd)
         except HDFSCliError, ex:
             if "File exists" in ex.stderr:
-                raise FileAlreadyExists(ex.stderr)
+                if raise_if_exists:
+                    raise FileAlreadyExists(ex.stderr)
             else:
                 raise
 
@@ -189,15 +218,15 @@ class HdfsClient(FileSystem):
             path = "."  # default to current/home catalog
 
         if recursive:
-            cmd = [load_hadoop_cmd(), 'fs'] + self.recursive_listdir_cmd + [path]
+            cmd = load_hadoop_cmd() + ['fs'] + self.recursive_listdir_cmd + [path]
         else:
-            cmd = [load_hadoop_cmd(), 'fs', '-ls', path]
+            cmd = load_hadoop_cmd() + ['fs', '-ls', path]
         lines = call_check(cmd).split('\n')
 
         for line in lines:
             if not line:
                 continue
-            elif line.startswith('Found'):
+            elif line.startswith('OpenJDK 64-Bit Server VM warning') or line.startswith('It\'s highly recommended') or line.startswith('Found'):
                 continue  # "hadoop fs -ls" outputs "Found %d items" as its first line
             elif ignore_directories and line[0] == 'd':
                 continue
@@ -256,27 +285,21 @@ class SnakebiteHdfsClient(HdfsClient):
         If Luigi has forked, we have a different PID, and need to reconnect.
         """
         if self.pid != os.getpid() or not self._bite:
-            autoconfig_enabled = self.config.getboolean("hdfs", "snakebite_autoconfig", False)
-            if autoconfig_enabled is True:
+            client_kwargs = dict(filter(lambda (k, v): v is not None and v != '',  {
+                'hadoop_version': self.config.getint("hdfs", "client_version", None),
+                'effective_user': self.config.get("hdfs", "effective_user", None)
+            }.items()))
+            if self.config.getboolean("hdfs", "snakebite_autoconfig", False):
                 """
                 This is fully backwards compatible with the vanilla Client and can be used for a non HA cluster as well.
                 This client tries to read ``${HADOOP_PATH}/conf/hdfs-site.xml`` to get the address of the namenode.
                 The behaviour is the same as Client.
                 """
                 from snakebite.client import AutoConfigClient
-                self._bite = AutoConfigClient()
+                self._bite = AutoConfigClient(**client_kwargs)
             else:
                 from snakebite.client import Client
-                try:
-                    ver = self.config.getint("hdfs", "client_version")
-                    if ver is None:
-                        raise RuntimeError()
-                    self._bite = Client(self.config.get("hdfs", "namenode_host"),
-                                       self.config.getint("hdfs", "namenode_port"),
-                                       hadoop_version=ver)
-                except:
-                    self._bite = Client(self.config.get("hdfs", "namenode_host"),
-                                       self.config.getint("hdfs", "namenode_port"))
+                self._bite = Client(self.config.get("hdfs", "namenode_host"), self.config.getint("hdfs", "namenode_port"), **client_kwargs)
         return self._bite
 
     def exists(self, path):
@@ -302,7 +325,7 @@ class SnakebiteHdfsClient(HdfsClient):
         :type dest: string
         :return: list of renamed items
         """
-        parts = dest.split('/')
+        parts = dest.rstrip('/').split('/')
         if len(parts) > 1:
             dir_path = '/'.join(parts[0:-1])
             if not self.exists(dir_path):
@@ -390,7 +413,7 @@ class SnakebiteHdfsClient(HdfsClient):
         return list(self.get_bite().copyToLocal(list_path(path),
                                                 local_destination))
 
-    def mkdir(self, path, parents=True, mode=0755):
+    def mkdir(self, path, parents=True, mode=0755, raise_if_exists=False):
         """
         Use snakebite.mkdir, if available.
 
@@ -404,11 +427,11 @@ class SnakebiteHdfsClient(HdfsClient):
         :param mode: \*nix style owner/group/other permissions
         :type mode: octal, default 0755
         """
-        bite = self.get_bite()
-        if bite.test(path, exists=True):
+        result = list(self.get_bite().mkdir(list_path(path),
+                                            create_parent=parents, mode=mode))
+        if raise_if_exists and "ile exists" in result[0].get('error', ''):
             raise luigi.target.FileAlreadyExists("%s exists" % (path, ))
-        return list(bite.mkdir(list_path(path), create_parent=parents,
-                               mode=mode))
+        return result
 
     def listdir(self, path, ignore_directories=False, ignore_files=False,
                 include_size=False, include_type=False, include_time=False,
@@ -458,7 +481,7 @@ class HdfsClientCdh3(HdfsClient):
         No -p switch, so this will fail creating ancestors
         '''
         try:
-            call_check([load_hadoop_cmd(), 'fs', '-mkdir', path])
+            call_check(load_hadoop_cmd() + ['fs', '-mkdir', path])
         except HDFSCliError, ex:
             if "File exists" in ex.stderr:
                 raise FileAlreadyExists(ex.stderr)
@@ -467,9 +490,9 @@ class HdfsClientCdh3(HdfsClient):
 
     def remove(self, path, recursive=True, skip_trash=False):
         if recursive:
-            cmd = [load_hadoop_cmd(), 'fs', '-rmr']
+            cmd = load_hadoop_cmd() + ['fs', '-rmr']
         else:
-            cmd = [load_hadoop_cmd(), 'fs', '-rm']
+            cmd = load_hadoop_cmd() + ['fs', '-rm']
 
         if skip_trash:
             cmd = cmd + ['-skipTrash']
@@ -484,7 +507,7 @@ class HdfsClientApache1(HdfsClientCdh3):
     recursive_listdir_cmd = ['-lsr']
 
     def exists(self, path):
-        cmd = [load_hadoop_cmd(), 'fs', '-test', '-e', path]
+        cmd = load_hadoop_cmd() + ['fs', '-test', '-e', path]
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True)
         stdout, stderr = p.communicate()
         if p.returncode == 0:
@@ -494,17 +517,63 @@ class HdfsClientApache1(HdfsClientCdh3):
         else:
             raise HDFSCliError(cmd, p.returncode, stdout, stderr)
 
-if get_hdfs_syntax() == "cdh4":
-    client = HdfsClient()
-elif get_hdfs_syntax() == "snakebite":
-    client = SnakebiteHdfsClient()
-elif get_hdfs_syntax() == "cdh3":
-    client = HdfsClientCdh3()
-elif get_hdfs_syntax() == "apache1":
-    client = HdfsClientApache1()
-else:
-    raise Exception("Error: Unknown version specified in Hadoop version configuration parameter")
 
+def get_configured_hadoop_version():
+    """
+    CDH4 (hadoop 2+) has a slightly different syntax for interacting with hdfs
+    via the command line. The default version is CDH4, but one can override
+    this setting with "cdh3" or "apache1" in the hadoop section of the config
+    in order to use the old syntax
+    """
+    return configuration.get_config().get("hadoop", "version", "cdh4").lower()
+
+
+def get_configured_hdfs_client(show_warnings=True):
+    """ This is a helper that fetches the configuration value for 'client' in
+    the [hdfs] section. It will return the client that retains backwards
+    compatibility when 'client' isn't configured. """
+    config = configuration.get_config()
+    custom = config.get("hdfs", "client", None)
+    if custom:
+        # Eventually this should be the only valid code path
+        return custom
+    if config.getboolean("hdfs", "use_snakebite", False):
+        if show_warnings:
+            warnings.warn("Deprecated: Just specify 'client: snakebite' in config")
+        return "snakebite"
+    if show_warnings:
+        warnings.warn("Deprecated: Specify 'client: hadoopcli' in config")
+    return "hadoopcli"  # The old default when not specified
+
+
+def create_hadoopcli_client():
+    """ Given that we want one of the hadoop cli clients (unlike snakebite),
+    this one will return the right one """
+    version = get_configured_hadoop_version()
+    if version == "cdh4":
+        return HdfsClient()
+    elif version == "cdh3":
+        return HdfsClientCdh3()
+    elif version == "apache1":
+        return HdfsClientApache1()
+    else:
+        raise Exception("Error: Unknown version specified in Hadoop version"
+                        "configuration parameter")
+
+def get_autoconfig_client(show_warnings=True):
+    """Creates the client as specified in the `client.cfg` configuration"""
+    configured_client = get_configured_hdfs_client(show_warnings=show_warnings)
+    if configured_client == "snakebite":
+        return SnakebiteHdfsClient()
+    if configured_client == "snakebite_with_hadoopcli_fallback":
+        return luigi.contrib.target.CascadingClient([SnakebiteHdfsClient(),
+                                                     create_hadoopcli_client()])
+    if configured_client == "hadoopcli":
+        return create_hadoopcli_client()
+    raise Exception("Unknown hdfs client " + get_configured_hdfs_client())
+
+# Suppress warnings so that importing luigi.hdfs doesn't show a deprecated warning.
+client = get_autoconfig_client(show_warnings=False)
 exists = client.exists
 rename = client.rename
 remove = client.remove
@@ -514,7 +583,7 @@ listdir = client.listdir
 
 class HdfsReadPipe(luigi.format.InputPipeProcessWrapper):
     def __init__(self, path):
-        super(HdfsReadPipe, self).__init__([load_hadoop_cmd(), 'fs', '-cat', path])
+        super(HdfsReadPipe, self).__init__(load_hadoop_cmd() + ['fs', '-cat', path])
 
 
 class HdfsAtomicWritePipe(luigi.format.OutputPipeProcessWrapper):
@@ -532,17 +601,13 @@ class HdfsAtomicWritePipe(luigi.format.OutputPipeProcessWrapper):
     def __init__(self, path):
         self.path = path
         self.tmppath = tmppath(self.path)
-        tmpdir = os.path.dirname(self.tmppath)
-        if get_hdfs_syntax() == "cdh4":
-            if subprocess.Popen([load_hadoop_cmd(), 'fs', '-mkdir', '-p', tmpdir], close_fds=True).wait():
-                raise RuntimeError("Could not create directory: %s" % tmpdir)
-        else:
-            if not exists(tmpdir) and subprocess.Popen([load_hadoop_cmd(), 'fs', '-mkdir', tmpdir], close_fds=True).wait():
-                raise RuntimeError("Could not create directory: %s" % tmpdir)
-        super(HdfsAtomicWritePipe, self).__init__([load_hadoop_cmd(), 'fs', '-put', '-', self.tmppath])
+        parent_dir = os.path.dirname(self.tmppath)
+        mkdir(parent_dir, parents=True, raise_if_exists=False)
+        super(HdfsAtomicWritePipe, self).__init__(load_hadoop_cmd() + ['fs', '-put', '-', self.tmppath])
 
     def abort(self):
-        print "Aborting %s('%s'). Removing temporary file '%s'" % (self.__class__.__name__, self.path, self.tmppath)
+        logger.info("Aborting %s('%s'). Removing temporary file '%s'",
+                self.__class__.__name__, self.path, self.tmppath)
         super(HdfsAtomicWritePipe, self).abort()
         remove(self.tmppath)
 
@@ -557,10 +622,11 @@ class HdfsAtomicWriteDirPipe(luigi.format.OutputPipeProcessWrapper):
         self.path = path
         self.tmppath = tmppath(self.path)
         self.datapath = self.tmppath + ("/data%s" % data_extension)
-        super(HdfsAtomicWriteDirPipe, self).__init__([load_hadoop_cmd(), 'fs', '-put', '-', self.datapath])
+        super(HdfsAtomicWriteDirPipe, self).__init__(load_hadoop_cmd() + ['fs', '-put', '-', self.datapath])
 
     def abort(self):
-        print "Aborting %s('%s'). Removing temporary dir '%s'" % (self.__class__.__name__, self.path, self.tmppath)
+        logger.info("Aborting %s('%s'). Removing temporary dir '%s'",
+                self.__class__.__name__, self.path, self.tmppath)
         super(HdfsAtomicWriteDirPipe, self).abort()
         remove(self.tmppath)
 
@@ -591,9 +657,8 @@ class PlainDir(luigi.format.Format):
 
 
 class HdfsTarget(FileSystemTarget):
-    fs = client  # underlying file system
 
-    def __init__(self, path=None, format=Plain, is_tmp=False):
+    def __init__(self, path=None, format=Plain, is_tmp=False, fs=None):
         if path is None:
             assert is_tmp
             path = tmppath()
@@ -601,7 +666,9 @@ class HdfsTarget(FileSystemTarget):
         self.format = format
         self.is_tmp = is_tmp
         (scheme, netloc, path, query, fragment) = urlparse.urlsplit(path)
-        assert ":" not in path  # colon is not allowed in hdfs filenames
+        if ":" in path:
+            raise ValueError('colon is not allowed in hdfs filenames')
+        self._fs = fs or get_autoconfig_client()
 
     def __del__(self):
         #TODO: not sure is_tmp belongs in Targets construction arguments
@@ -609,19 +676,8 @@ class HdfsTarget(FileSystemTarget):
             self.remove()
 
     @property
-    def fn(self):
-        """ Deprecated. Use path property instead """
-        import warnings
-        warnings.warn("target.fn is deprecated and will be removed soon\
-in luigi. Use target.path instead", stacklevel=2)
-        return self.path
-
-    def get_fn(self):
-        """ Deprecated. Use path property instead """
-        import warnings
-        warnings.warn("target.get_fn() is deprecated and will be removed soon\
-in luigi. Use target.path instead", stacklevel=2)
-        return self.path
+    def fs(self):
+        return self._fs
 
     def glob_exists(self, expected_files):
         ls = list(listdir(self.path))
@@ -647,22 +703,31 @@ in luigi. Use target.path instead", stacklevel=2)
     def remove(self, skip_trash=False):
         remove(self.path, skip_trash=skip_trash)
 
+    @luigi.util.deprecate_kwarg('fail_if_exists', 'raise_if_exists', False)
     def rename(self, path, fail_if_exists=False):
-        # rename does not change self.path, so be careful with assumptions
+        """ Rename does not change self.path, so be careful with assumptions
+
+        Not recommendeed for directories. Use move_dir.  spotify/luigi#522
+        """
         if isinstance(path, HdfsTarget):
             path = path.path
         if fail_if_exists and exists(path):
             raise RuntimeError('Destination exists: %s' % path)
         rename(self.path, path)
 
+    @luigi.util.deprecate_kwarg('fail_if_exists', 'raise_if_exists', False)
     def move(self, path, fail_if_exists=False):
-        self.rename(path, fail_if_exists=fail_if_exists)
+        """ Move does not change self.path, so be careful with assumptions
+
+        Not recommendeed for directories. Use move_dir.  spotify/luigi#522
+        """
+        self.rename(path, raise_if_exists=fail_if_exists)
 
     def move_dir(self, path):
         # mkdir will fail if directory already exists, thereby ensuring atomicity
         if isinstance(path, HdfsTarget):
             path = path.path
-        mkdir(path)
+        mkdir(path, parents=False, raise_if_exists=True)
         rename(self.path + '/*', path)
         self.remove()
 
@@ -687,7 +752,7 @@ in luigi. Use target.path instead", stacklevel=2)
 
     def _is_writable(self, path):
         test_path = path + '.test_write_access-%09d' % random.randrange(1e10)
-        return_value = subprocess.call([load_hadoop_cmd(), 'fs', '-touchz', test_path])
+        return_value = subprocess.call(load_hadoop_cmd() + ['fs', '-touchz', test_path])
         if return_value != 0:
             return False
         else:

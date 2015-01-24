@@ -17,6 +17,7 @@ import json
 import os
 import atexit
 import mimetypes
+import posixpath
 import tornado.ioloop
 import tornado.netutil
 import tornado.web
@@ -38,12 +39,24 @@ def _create_scheduler():
     remove_delay = config.getfloat('scheduler', 'remove-delay', 600.0)
     worker_disconnect_delay = config.getfloat('scheduler', 'worker-disconnect-delay', 60.0)
     state_path = config.get('scheduler', 'state-path', '/var/lib/luigi-server/state.pickle')
+
+    # Jobs are disabled if we see more than disable_failures failures in disable_window seconds.
+    # These disables last for disable_persist seconds.
+    disable_window = config.getint('scheduler', 'disable-window-seconds', 3600)
+    disable_failures = config.getint('scheduler', 'disable-num-failures', None)
+    disable_persist = config.getint('scheduler', 'disable-persist-seconds', 86400)
+    max_shown_tasks = config.getint('scheduler', 'max-shown-tasks', 100000)
+
+    resources = config.getintdict('resources')
     if config.getboolean('scheduler', 'record_task_history', False):
         import db_task_history  # Needs sqlalchemy, thus imported here
         task_history_impl = db_task_history.DbTaskHistory()
     else:
         task_history_impl = task_history.NopHistory()
-    return scheduler.CentralPlannerScheduler(retry_delay, remove_delay, worker_disconnect_delay, state_path, task_history_impl)
+    return scheduler.CentralPlannerScheduler(
+        retry_delay, remove_delay, worker_disconnect_delay, state_path, task_history_impl,
+        resources, disable_persist, disable_window, disable_failures, max_shown_tasks,
+    )
 
 
 class RPCHandler(tornado.web.RequestHandler):
@@ -61,6 +74,8 @@ class RPCHandler(tornado.web.RequestHandler):
             self.write({"response": result})  # wrap all json response in a dictionary
         else:
             self.send_error(404)
+
+    post = get
 
 
 class BaseTaskHistoryHandler(tornado.web.RequestHandler):
@@ -99,8 +114,12 @@ class ByParamsHandler(BaseTaskHistoryHandler):
 
 class StaticFileHandler(tornado.web.RequestHandler):
     def get(self, path):
-        # TODO: this is probably not the right way to do it...
-        # TODO: security
+        # Path checking taken from Flask's safe_join function:
+        # https://github.com/mitsuhiko/flask/blob/1d55b8983/flask/helpers.py#L563-L587
+        path = posixpath.normpath(path)
+        if os.path.isabs(path) or path.startswith(".."):
+            return self.send_error(404)
+
         extension = os.path.splitext(path)[1]
         if extension in mimetypes.types_map:
             self.set_header("Content-Type", mimetypes.types_map[extension])
@@ -157,7 +176,10 @@ def run(api_port=8082, address=None, scheduler=None, responder=None):
 
     signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
-    signal.signal(signal.SIGQUIT, shutdown_handler)
+    if os.name == 'nt':
+            signal.signal(signal.SIGBREAK, shutdown_handler)
+    else:
+            signal.signal(signal.SIGQUIT, shutdown_handler)
     atexit.register(shutdown_handler)
 
     logger.info("Scheduler starting up")

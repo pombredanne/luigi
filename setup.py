@@ -13,27 +13,44 @@
 # the License.
 
 import os
+import sys
 
 try:
     from setuptools import setup
 except:
     from distutils.core import setup
 
+
 def get_static_files(path):
     return [os.path.join(dirpath.replace("luigi/", ""), ext) 
             for (dirpath, dirnames, filenames) in os.walk(path)
             for ext in ["*.html", "*.js", "*.css", "*.png"]]
 
+
 luigi_package_data = sum(map(get_static_files, ["luigi/static", "luigi/templates"]), [])
 
-long_description = ['Note: For the latest source, discussion, etc, please visit the `Github repository <https://github.com/spotify/luigi>`_\n\n']
-for line in open('README.rst'):
-    long_description.append(line)
-long_description = ''.join(long_description)
+readme_note = """\
+.. note::
+
+   For the latest source, discussion, etc, please visit the
+   `GitHub repository <https://github.com/spotify/luigi>`_\n\n
+"""
+
+with open('README.rst') as fobj:
+    long_description = readme_note + fobj.read()
+
+install_requires = [
+    'pyparsing',
+    'tornado',
+    'snakebite>=2.4.10',
+]
+
+if sys.version_info[:2] < (2, 7):
+    install_requires.extend(['argparse', 'ordereddict'])
 
 setup(
     name='luigi',
-    version='1.0.16',
+    version='1.0.19',
     description='Workflow mgmgt + task scheduling + dependency resolution',
     long_description=long_description,
     author='Erik Bernhardsson',
@@ -43,11 +60,14 @@ setup(
     packages=[
         'luigi',
         'luigi.contrib',
+        'luigi.tools'
     ],
     package_data={
         'luigi': luigi_package_data
     },
     scripts=[
-        'bin/luigid'
-    ]
+        'bin/luigid',
+        'bin/luigi'
+    ],
+    install_requires=install_requires,
 )

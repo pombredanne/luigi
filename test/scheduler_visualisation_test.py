@@ -55,6 +55,20 @@ class FactorTask(luigi.Task):
         return luigi.LocalTarget(os.path.join(tempdir, 'luigi_test_factor_%d' % self.product))
 
 
+class BadReqTask(luigi.Task):
+    succeed = luigi.BooleanParameter()
+
+    def requires(self):
+        assert self.succeed
+        yield BadReqTask(False)
+
+    def run(self):
+        pass
+
+    def complete(self):
+        return False
+
+
 class FailingTask(luigi.Task):
     task_id = luigi.Parameter()
 
@@ -118,8 +132,11 @@ class SchedulerVisualisationTest(unittest.TestCase):
         self.assertLessEqual(d2[u'start_time'], end)
 
     def _assert_all_done(self, tasks):
+        self._assert_all(tasks, u'DONE')
+
+    def _assert_all(self, tasks, status):
         for task in tasks.values():
-            self.assertEqual(task[u'status'], u'DONE')
+            self.assertEqual(task[u'status'], status)
 
     def test_dep_graph_single(self):
         self._build([FactorTask(1)])
@@ -160,6 +177,19 @@ class SchedulerVisualisationTest(unittest.TestCase):
         d5 = dep_graph[u'FactorTask(product=5)']
         self.assertEqual(sorted(d5[u'deps']), [])
 
+    def test_dep_graph_missing_deps(self):
+        self._build([BadReqTask(True)])
+        dep_graph = self._remote().dep_graph('BadReqTask(succeed=True)')
+        self.assertEqual(len(dep_graph), 2)
+
+        suc = dep_graph[u'BadReqTask(succeed=True)']
+        self.assertEqual(suc[u'deps'], [u'BadReqTask(succeed=False)'])
+
+        fail = dep_graph[u'BadReqTask(succeed=False)']
+        self.assertEqual(fail[u'name'], 'BadReqTask')
+        self.assertEqual(fail[u'params'], {'succeed': 'False'})
+        self.assertEqual(fail[u'status'], 'UNKNOWN')
+
     def test_dep_graph_diamond(self):
         self._build([FactorTask(12)])
         remote = self._remote()
@@ -188,7 +218,6 @@ class SchedulerVisualisationTest(unittest.TestCase):
 
         t7 = tasks_done.get(u'FactorTask(product=7)')
         self.assertEqual(type(t7), type({}))
-        self.assertEqual(t7[u'deps'], [])
 
         self.assertEqual(remote.task_list('', ''), tasks_done)
         self.assertEqual(remote.task_list('FAILED', ''), {})
@@ -202,7 +231,6 @@ class SchedulerVisualisationTest(unittest.TestCase):
 
         f8 = failed.get(u'FailingTask(task_id=8)')
         self.assertEqual(f8[u'status'], u'FAILED')
-        self.assertEqual(f8[u'deps'], [])
 
         self.assertEqual(remote.task_list('DONE', ''), {})
         self.assertEqual(remote.task_list('PENDING', ''), {})
@@ -237,31 +265,26 @@ class SchedulerVisualisationTest(unittest.TestCase):
         done = remote.task_list('DONE', '')
         self.assertEqual(len(done), 1)
         db = done.get('B()')
-        self.assertEqual(db['deps'], [])
         self.assertEqual(db['status'], 'DONE')
 
         missing_input = remote.task_list('PENDING', 'UPSTREAM_MISSING_INPUT')
         self.assertEqual(len(missing_input), 2)
 
         pa = missing_input.get(u'A()')
-        self.assertEqual(pa['deps'], [])
         self.assertEqual(pa['status'], 'PENDING')
         self.assertEqual(remote._upstream_status('A()', {}), 'UPSTREAM_MISSING_INPUT')
 
         pc = missing_input.get(u'C()')
-        self.assertEqual(sorted(pc['deps']), ['A()', 'B()'])
         self.assertEqual(pc['status'], 'PENDING')
         self.assertEqual(remote._upstream_status('C()', {}), 'UPSTREAM_MISSING_INPUT')
 
         upstream_failed = remote.task_list('PENDING', 'UPSTREAM_FAILED')
         self.assertEqual(len(upstream_failed), 2)
         pe = upstream_failed.get(u'E()')
-        self.assertEqual(sorted(pe['deps']), ['C()', 'D()'])
         self.assertEqual(pe['status'], 'PENDING')
         self.assertEqual(remote._upstream_status('E()', {}), 'UPSTREAM_FAILED')
 
         pe = upstream_failed.get(u'D()')
-        self.assertEqual(sorted(pe['deps']), ['F()'])
         self.assertEqual(pe['status'], 'PENDING')
         self.assertEqual(remote._upstream_status('D()', {}), 'UPSTREAM_FAILED')
 
@@ -273,7 +296,6 @@ class SchedulerVisualisationTest(unittest.TestCase):
         failed = remote.task_list('FAILED', '')
         self.assertEqual(len(failed), 1)
         fd = failed.get('F()')
-        self.assertEqual(fd['deps'], [])
         self.assertEqual(fd['status'], 'FAILED')
 
         all = dict(pending)
@@ -281,6 +303,15 @@ class SchedulerVisualisationTest(unittest.TestCase):
         all.update(failed)
         self.assertEqual(remote.task_list('', ''), all)
         self.assertEqual(remote.task_list('RUNNING', ''), {})
+
+    def test_task_search(self):
+        self._build([FactorTask(8)])
+        self._build([FailingTask(8)])
+        remote = self._remote()
+        all_tasks = remote.task_search('Task')
+        self.assertEqual(len(all_tasks), 2)
+        self._assert_all(all_tasks['DONE'], 'DONE')
+        self._assert_all(all_tasks['FAILED'], 'FAILED')
 
     def test_fetch_error(self):
         self._build([FailingTask(8)])
@@ -315,13 +346,82 @@ class SchedulerVisualisationTest(unittest.TestCase):
         def assert_has_deps(task_id, deps):
             self.assertTrue(task_id in dep_graph, '%s not in dep_graph %s' % (task_id, dep_graph))
             task = dep_graph[task_id]
-            self.assertEquals(sorted(task['deps']), sorted(deps), '%s does not have deps %s' % (task_id, deps))
+            self.assertEqual(sorted(task['deps']), sorted(deps), '%s does not have deps %s' % (task_id, deps))
 
         assert_has_deps('X()', ['Y()'])
         assert_has_deps('Y()', ['Z(id=1)', 'Z(id=2)'])
         assert_has_deps('Z(id=1)', ['ZZ()'])
         assert_has_deps('Z(id=2)', ['ZZ()'])
         assert_has_deps('ZZ()', [])
+
+    def test_simple_worker_list(self):
+        class X(luigi.Task):
+            def run(self):
+                self._complete = True
+
+            def complete(self):
+                return getattr(self, '_complete', False)
+
+        self._build([X()])
+
+        workers = self._remote().worker_list()
+
+        self.assertEqual(1, len(workers))
+        worker = workers[0]
+        self.assertEqual('X()', worker['first_task'])
+        self.assertEqual(0, worker['num_pending'])
+        self.assertEqual(0, worker['num_uniques'])
+        self.assertEqual(0, worker['num_running'])
+        self.assertEqual(1, worker['workers'])
+
+    def test_worker_list_pending_uniques(self):
+        class X(luigi.Task):
+            def complete(self):
+                return False
+
+        class Y(X):
+            def requires(self):
+                return X()
+
+        class Z(Y):
+            pass
+
+        w1 = luigi.worker.Worker(scheduler=self.scheduler, worker_processes=1)
+        w2 = luigi.worker.Worker(scheduler=self.scheduler, worker_processes=1)
+
+        w1.add(Y())
+        w2.add(Z())
+
+        workers = self._remote().worker_list()
+        self.assertEqual(2, len(workers))
+        for worker in workers:
+            self.assertEqual(2, worker['num_pending'])
+            self.assertEqual(1, worker['num_uniques'])
+            self.assertEqual(0, worker['num_running'])
+
+    def test_worker_list_running(self):
+        class X(luigi.Task):
+            n = luigi.IntParameter()
+
+        w = luigi.worker.Worker(scheduler=self.scheduler, worker_processes=3)
+        w.add(X(0))
+        w.add(X(1))
+        w.add(X(2))
+        w.add(X(3))
+
+        w._get_work()
+        w._get_work()
+        w._get_work()
+
+        workers = self._remote().worker_list()
+        self.assertEqual(1, len(workers))
+        worker = workers[0]
+
+        self.assertEqual(3, worker['num_running'])
+        self.assertEqual(1, worker['num_pending'])
+        self.assertEqual(1, worker['num_uniques'])
+
+
 
 if __name__ == '__main__':
     unittest.main()

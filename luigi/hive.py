@@ -12,6 +12,7 @@
 
 import abc
 import logging
+import operator
 import luigi
 import luigi.hadoop
 from luigi.target import FileSystemTarget, FileAlreadyExists
@@ -113,9 +114,9 @@ class HiveCommandClient(HiveClient):
 
     def table_exists(self, table, database='default', partition={}):
         if not partition:
-            stdout = run_hive_cmd('use {0}; describe {1}'.format(database, table))
+            stdout = run_hive_cmd('use {0}; show tables like "{1}";'.format(database, table))
 
-            return not "does not exist" in stdout
+            return stdout and table in stdout
         else:
             stdout = run_hive_cmd("""use %s; show partitions %s partition
                                 (%s)""" % (database, table, self.partition_spec(partition)))
@@ -133,7 +134,8 @@ class HiveCommandClient(HiveClient):
 
     def partition_spec(self, partition):
         """ Turns a dict into the a Hive partition specification string """
-        return ','.join(["{0}='{1}'".format(k, v) for (k, v) in partition.items()])
+        return ','.join(["{0}='{1}'".format(k, v) for (k, v) in
+                         sorted(partition.items(), key=operator.itemgetter(0))])
 
 
 class ApacheHiveCommandClient(HiveCommandClient):
@@ -141,28 +143,6 @@ class ApacheHiveCommandClient(HiveCommandClient):
     A subclass for the HiveCommandClient to (in some cases) ignore the return code from
     the hive command so that we can just parse the output.
     """
-    def table_exists(self, table, database='default', partition={}):
-        if not partition:
-            # Hive 0.11 returns 17 as the exit status if the table does not exist.
-            # The actual message is: [Error 10001]: Table not found tablename
-            # stdout is empty and an error message is returned on stderr.
-            # This is why we can't check the return code on this command and
-            # assume if stdout is empty that the table doesn't exist.
-            stdout = run_hive_cmd('use {0}; describe {1}'.format(database, table), False)
-            if stdout:
-                return not "Table not found" in stdout
-            else:
-                # Hive returned a non-zero exit status and printed its output to stderr not stdout
-                return False
-        else:
-            stdout = run_hive_cmd("""use %s; show partitions %s partition
-                                (%s)""" % (database, table, self.partition_spec(partition)), False)
-
-            if stdout:
-                return True
-            else:
-                return False
-
     def table_schema(self, table, database='default'):
         describe = run_hive_cmd("use {0}; describe {1}".format(database, table), False)
         if not describe or "Table not found" in describe:
@@ -185,16 +165,26 @@ class MetastoreClient(HiveClient):
             if not partition:
                 return table in client.get_all_tables(database)
             else:
-                partition_str = self.partition_spec(partition)
-                # -1 is max_parts, the # of partition names to return (-1 = unlimited)
-                return partition_str in client.get_partition_names(database, table, -1)
+                return partition in self._existing_partitions(table, database, client)
+
+    def _existing_partitions(self, table, database, client):
+        def _parse_partition_string(partition_string):
+            partition_def = {}
+            for part in partition_string.split("/"):
+                name, value = part.split("=")
+                partition_def[name] = value
+            return partition_def
+
+        # -1 is max_parts, the # of partition names to return (-1 = unlimited)
+        partition_strings = client.get_partition_names(database, table, -1)
+        return [_parse_partition_string(existing_partition) for existing_partition in partition_strings]
 
     def table_schema(self, table, database='default'):
         with HiveThriftContext() as client:
             return [(field_schema.name, field_schema.type) for field_schema in client.get_schema(database, table)]
 
     def partition_spec(self, partition):
-        return "/".join("%s=%s" % (k, v) for (k, v) in partition.items())
+        return "/".join("%s=%s" % (k, v) for (k, v) in sorted(partition.items(), key=operator.itemgetter(0)))
 
 
 class HiveThriftContext(object):
@@ -231,35 +221,6 @@ else:
 client = default_client
 
 
-def _deprecated(message):
-    import warnings
-    warnings.warn(message=message, category=DeprecationWarning, stacklevel=2)
-
-
-def table_location(**kwargs):
-    """ Deprecated. Use an instance of client instead and call client.table_location """
-    _deprecated("luigi.hive.table_location is deprecated and will be removed soon, use hive.default_client or create a client instead")
-    return default_client.table_location(**kwargs)
-
-
-def table_exists(**kwargs):
-    """ Deprecated. Use an instance of client instead and call client.table_exists """
-    _deprecated("luigi.hive.table_exists is deprecated and will be removed soon, use hive.default_client or create a client instead")
-    return default_client.table_exists(**kwargs)
-
-
-def table_schema(**kwargs):
-    """ Deprecated. Use an instance of client instead and call client.table_schema """
-    _deprecated("luigi.hive.table_schema is deprecated and will be removed soon, use hive.default_client or create a client instead")
-    return default_client.table_schema(**kwargs)
-
-
-def partition_spec(**kwargs):
-    """ Deprecated. Use an instance of client instead and call client.partition_spec """
-    _deprecated("luigi.hive.partition_spec is deprecated and will be removed soon, use hive.default_client or create a client instead")
-    return default_client.partition_spec(**kwargs)
-
-
 class HiveQueryTask(luigi.hadoop.BaseHadoopJobTask):
     """ Task to run a hive query """
     # by default, we let hive figure these out.
@@ -273,9 +234,10 @@ class HiveQueryTask(luigi.hadoop.BaseHadoopJobTask):
         raise RuntimeError("Must implement query!")
 
     def hiverc(self):
-        """ Location of an rc file to run before the query 
+        """ Location of an rc file to run before the query
             if hiverc-location key is specified in client.cfg, will default to the value there
             otherwise returns None
+            Returning a list of rc files will load all of them in order.
         """
         return luigi.configuration.get_config().get('hive', 'hiverc-location', default=None)
 
@@ -337,8 +299,12 @@ class HiveQueryRunner(luigi.hadoop.JobRunner):
             f.write(job.query())
             f.flush()
             arglist = [load_hive_cmd(), '-f', f.name]
-            if job.hiverc():
-                arglist += ['-i', job.hiverc()]
+            hiverc = job.hiverc()
+            if hiverc:
+                if type(hiverc) == str:
+                    hiverc = [hiverc]
+                for rcfile in hiverc:
+                    arglist += ['-i', rcfile]
             if job.hiveconfs():
                 for k, v in job.hiveconfs().iteritems():
                     arglist += ['--hiveconf', '{0}={1}'.format(k, v)]

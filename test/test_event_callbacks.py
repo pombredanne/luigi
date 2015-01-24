@@ -1,4 +1,6 @@
 from unittest import TestCase
+from mock import patch
+import random
 from luigi import Task, build, Event
 from luigi.mock import MockFile, MockFileSystem
 from luigi.task import flatten
@@ -22,6 +24,18 @@ class TaskWithCallback(Task):
 
 
 class TestEventCallbacks(TestCase):
+    def test_start_handler(self):
+        saved_tasks = []
+
+        @EmptyTask.event_handler(Event.START)
+        def save_task(task):
+            print "Saving task..."
+            saved_tasks.append(task)
+
+        t = EmptyTask(True)
+        build([t], local_scheduler=True)
+        self.assertEqual(saved_tasks, [t])
+
     def test_success_handler(self):
         saved_tasks = []
 
@@ -32,19 +46,22 @@ class TestEventCallbacks(TestCase):
 
         t = EmptyTask(False)
         build([t], local_scheduler=True)
-        self.assertEquals(saved_tasks[0], t)
+        self.assertEqual(saved_tasks, [t])
 
     def test_failure_handler(self):
+        saved_tasks = []
         exceptions = []
 
         @EmptyTask.event_handler(Event.FAILURE)
         def save_task(task, exception):
-            print "Saving exception..."
+            print "Saving task and exception..."
+            saved_tasks.append(task)
             exceptions.append(exception)
 
         t = EmptyTask(True)
         build([t], local_scheduler=True)
-        self.assertEquals(type(exceptions[0]), DummyException)
+        self.assertEqual(saved_tasks, [t])
+        self.assertTrue(isinstance(exceptions[0], DummyException))
 
     def test_custom_handler(self):
         dummies = []
@@ -55,7 +72,20 @@ class TestEventCallbacks(TestCase):
 
         t = TaskWithCallback()
         build([t], local_scheduler=True)
-        self.assertEquals(dummies[0], "foo")
+        self.assertEqual(dummies[0], "foo")
+
+    def test_processing_time_handler(self):
+        @EmptyTask.event_handler(Event.PROCESSING_TIME)
+        def save_task(task, processing_time):
+            self.result = task, processing_time
+
+        times = [43.0, 1.0]
+        t = EmptyTask(random.choice([True, False]))
+        with patch('luigi.worker.time') as mock:
+            mock.time = times.pop
+            build([t], local_scheduler=True)
+        self.assertTrue(self.result[0] is t)
+        self.assertEqual(self.result[1], 42.0)
 
 
 #        A
@@ -124,7 +154,7 @@ class TestDependencyEvents(TestCase):
             actual_events.setdefault(Event.DEPENDENCY_PRESENT, set()).add(tuple(map(lambda t: t.task_id, args)))
 
         build([task], local_scheduler=True)
-        self.assertEquals(actual_events, expected_events)
+        self.assertEqual(actual_events, expected_events)
 
     def test_incomplete_dag(self):
         for param in range(1, 3):
@@ -170,4 +200,4 @@ class TestDependencyEvents(TestCase):
                 ('D(param=3)',),
             ]),
         })
-        self.assertEquals(eval_contents(A().output()), ['A(param=1)', ['B(param=1)', ['C(param=1)', ['D(param=1)'], ['D(param=2)']]], ['B(param=2)', ['C(param=2)', ['D(param=2)'], ['D(param=3)']]]])
+        self.assertEqual(eval_contents(A().output()), ['A(param=1)', ['B(param=1)', ['C(param=1)', ['D(param=1)'], ['D(param=2)']]], ['B(param=2)', ['C(param=2)', ['D(param=2)'], ['D(param=3)']]]])

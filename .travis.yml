@@ -1,12 +1,26 @@
 language: python
+
 python:
   - "2.7"
   - "2.6"
-install: 
-  - pip install tornado --use-mirrors
-  - pip install argparse --use-mirrors
-  - pip install sqlalchemy --use-mirrors
-  - pip install mock --use-mirrors
-  - pip install boto --use-mirrors
-  - pip install moto --use-mirrors
-script: nosetests
+
+jdk: oraclejdk7
+
+env:
+  global:
+    - PIP_DOWNLOAD_CACHE=$HOME/.pip-cache
+  matrix:
+    - TOX_ENV=cdh
+    - TOX_ENV=hdp
+
+sudo: false
+
+cache:
+  - $HOME/.pip-cache
+
+install:
+  - pip install tox
+
+script: tox -e $TOX_ENV
+
+after_failure: cat /home/travis/build/spotify/luigi/.tox/cdh/log/cdh-1.log

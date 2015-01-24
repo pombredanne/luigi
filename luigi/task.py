@@ -17,6 +17,8 @@ import logging
 import parameter
 import warnings
 import traceback
+import itertools
+import pyparsing as pp
 
 Parameter = parameter.Parameter
 logger = logging.getLogger('luigi-interface')
@@ -38,19 +40,40 @@ def id_to_name_and_params(task_id):
         E.g. calling with ``Foo(bar=bar, baz=baz)`` returns
         ``('Foo', {'bar': 'bar', 'baz': 'baz'})``
     '''
-    lparen = task_id.index('(')
-    task_family = task_id[:lparen]
-    params = task_id[lparen + 1:-1]
+    name_chars = pp.alphanums + '_'
+    # modified version of pp.printables. Removed '[]', '()', ','
+    value_chars = pp.alphanums + '\'!"#$%&*+-./:;<=>?@\\^_`{|}~'
+    parameter = (
+        (pp.Word(name_chars) +
+         pp.Literal('=').suppress() +
+         ((pp.Literal('(').suppress() | pp.Literal('[').suppress()) +
+          pp.ZeroOrMore(pp.Word(value_chars) +
+                        pp.ZeroOrMore(pp.Literal(',')).suppress()) +
+          (pp.Literal(')').suppress() |
+           pp.Literal(']').suppress()))).setResultsName('list_params',
+                                                        listAllMatches=True) |
+        (pp.Word(name_chars) +
+         pp.Literal('=').suppress() +
+         pp.Word(value_chars)).setResultsName('params', listAllMatches=True))
 
-    def split_equals(x):
-        equals = x.index('=')
-        return x[:equals], x[equals + 1:]
-    if params:
-        param_list = map(split_equals, params.split(', '))  # TODO: param values with ', ' in them will break this
-    else:
-        param_list = []
-    return task_family, dict(param_list)
+    parser = (
+        pp.Word(name_chars).setResultsName('task') +
+        pp.Literal('(').suppress() +
+        pp.ZeroOrMore(parameter + (pp.Literal(',')).suppress()) +
+        pp.ZeroOrMore(parameter) +
+        pp.Literal(')').suppress())
 
+    parsed = parser.parseString(task_id).asDict()
+    task_name = parsed['task']
+
+    params = {}
+    if 'params' in parsed:
+        for k, v in parsed['params']:
+            params[k] = v
+    if 'list_params' in parsed:
+        for x in parsed['list_params']:
+            params[x[0]] = x[1:]
+    return task_name, params
 
 
 class Register(abc.ABCMeta):
@@ -158,22 +181,33 @@ class Register(abc.ABCMeta):
         return reg
 
     @classmethod
-    def get_global_params(cls):
-        """Compiles and returns the global parameters for all :py:class:`Task`.
+    def tasks_str(cls):
+        """Human-readable register contents dump.
+        """
+        return repr(sorted(Register.get_reg().keys()))
+
+    @classmethod
+    def get_task_cls(cls, name):
+        """Returns an unambiguous class or raises an exception.
+        """
+        task_cls = Register.get_reg().get(name)
+        if not task_cls:
+            raise Exception('Task %r not found. Candidates are: %s' % (name, Register.tasks_str()))
+        if task_cls == Register.AMBIGUOUS_CLASS:
+            raise Exception('Task %r is ambiguous' % name)
+        return task_cls
+
+    @classmethod
+    def get_all_params(cls):
+        """Compiles and returns all parameters for all :py:class:`Task`.
 
         :return: a ``dict`` of parameter name -> parameter.
         """
-        global_params = {}
-        for t_name, t_cls in cls.get_reg().iteritems():
-            if t_cls == cls.AMBIGUOUS_CLASS:
+        for task_name, task_cls in cls.get_reg().iteritems():
+            if task_cls == cls.AMBIGUOUS_CLASS:
                 continue
-            for param_name, param_obj in t_cls.get_global_params():
-                if param_name in global_params and global_params[param_name] != param_obj:
-                    # Could be registered multiple times in case there's subclasses
-                    raise Exception('Global parameter %r registered by multiple classes' % param_name)
-                global_params[param_name] = param_obj
-        return global_params.iteritems()
-
+            for param_name, param_obj in task_cls.get_params():
+                yield task_name, param_name, param_obj
 
 
 class Task(object):
@@ -211,6 +245,19 @@ class Task(object):
 
     _event_callbacks = {}
 
+    # Priority of the task: the scheduler should favor available
+    # tasks with higher priority values first.
+    priority = 0
+    disabled = False
+
+    # Resources used by the task. Should be formatted like {"scp": 1} to indicate that the
+    # task requires 1 unit of the scp resource.
+    resources = {}
+
+    # Number of seconds after which to time out the run function. No timeout if set to 0. Defaults
+    # to 0 or value in client.cfg
+    worker_timeout = None
+
     @classmethod
     def event_handler(cls, event):
         """ Decorator for adding event handlers """
@@ -237,6 +284,12 @@ class Task(object):
                     pass
 
     @property
+    def task_module(self):
+        # Returns what Python module to import to get access to this class
+        # TODO(erikbern): we should think about a language-agnostic mechanism
+        return self.__class__.__module__
+
+    @property
     def task_family(self):
         """Convenience method since a property on the metaclass isn't directly
         accessible through the class instances.
@@ -260,16 +313,6 @@ class Task(object):
         return params
 
     @classmethod
-    def get_global_params(cls):
-        """Return the global parameters for this Task."""
-        return [(param_name, param_obj) for param_name, param_obj in cls.get_params() if param_obj.is_global]
-
-    @classmethod
-    def get_nonglobal_params(cls):
-        """Return the non-global parameters for this Task."""
-        return [(param_name, param_obj) for param_name, param_obj in cls.get_params() if not param_obj.is_global]
-
-    @classmethod
     def get_param_values(cls, params, args, kwargs):
         """Get the values of the parameters from the args and kwargs.
 
@@ -287,7 +330,7 @@ class Task(object):
         exc_desc = '%s[args=%s, kwargs=%s]' % (cls.__name__, args, kwargs)
 
         # Fill in the positional arguments
-        positional_params = [(n, p) for n, p in params if not p.is_global]
+        positional_params = [(n, p) for n, p in params]
         for i, arg in enumerate(args):
             if i >= len(positional_params):
                 raise parameter.UnknownParameterException('%s: takes at most %d parameters (%d given)' % (exc_desc, len(positional_params), len(args)))
@@ -300,16 +343,14 @@ class Task(object):
                 raise parameter.DuplicateParameterException('%s: parameter %s was already set as a positional parameter' % (exc_desc, param_name))
             if param_name not in params_dict:
                 raise parameter.UnknownParameterException('%s: unknown parameter %s' % (exc_desc, param_name))
-            if params_dict[param_name].is_global:
-                raise parameter.ParameterException('%s: can not override global parameter %s' % (exc_desc, param_name))
             result[param_name] = arg
 
         # Then use the defaults for anything not filled in
         for param_name, param_obj in params:
             if param_name not in result:
-                if not param_obj.has_default:
+                if not param_obj.has_value:
                     raise parameter.MissingParameterException("%s: requires the '%s' parameter to be set" % (exc_desc, param_name))
-                result[param_name] = param_obj.default
+                result[param_name] = param_obj.value
 
         def list_to_tuple(x):
             """ Make tuples out of lists and sets to allow hashing """
@@ -356,25 +397,26 @@ class Task(object):
         return hasattr(self, 'task_id')
 
     @classmethod
-    def from_input(cls, params, global_params):
+    def from_str_params(cls, params_str={}):
         """Creates an instance from a str->str hash
 
-        This method is for parsing of command line arguments or other
-        non-programmatic invocations.
-
-        :param params: dict of param name -> value.
-        :param global_params: dict of param name -> value, the global params.
+        :param params_str: dict of param name -> value.
         """
-        for param_name, param in global_params:
-            value = param.parse_from_input(param_name, params[param_name])
-            param.set_default(value)
-
         kwargs = {}
-        for param_name, param in cls.get_nonglobal_params():
-            value = param.parse_from_input(param_name, params[param_name])
+        for param_name, param in cls.get_params():
+            value = param.parse_from_input(param_name, params_str[param_name])
             kwargs[param_name] = value
 
         return cls(**kwargs)
+
+    def to_str_params(self):
+        # Convert all parameters to a str->str hash
+        params_str = {}
+        params = dict(self.get_params())
+        for param_name, param_value in self.param_kwargs.iteritems():
+            params_str[param_name] = params[param_name].serialize(param_value)
+
+        return params_str
 
     def clone(self, cls=None, **kwargs):
         ''' Creates a new instance from an existing instance where some of the args have changed.
@@ -388,9 +430,9 @@ class Task(object):
 
         if cls is None:
             cls = self.__class__
-        
+
         new_k = {}
-        for param_name, param_class in cls.get_nonglobal_params():
+        for param_name, param_class in cls.get_params():
             if param_name in k:
                 new_k[param_name] = k[param_name]
 
@@ -402,22 +444,34 @@ class Task(object):
     def __repr__(self):
         return self.task_id
 
+    def __eq__(self, other):
+        return self.__class__ == other.__class__ and self.param_args == other.param_args
+
     def complete(self):
         """
             If the task has any outputs, return ``True`` if all outputs exists.
-            Otherwise, return whether or not the task has run or not
+            Otherwise, return ``False``.
+
+            However, you may freely override this method with custom logic.
         """
         outputs = flatten(self.output())
         if len(outputs) == 0:
-            # TODO: unclear if tasks without outputs should always run or never run
-            warnings.warn("Task %r without outputs has no custom complete() method" % self)
+            warnings.warn(
+                "Task %r without outputs has no custom complete() method" % self,
+                stacklevel=2
+            )
             return False
 
-        for output in outputs:
-            if not output.exists():
-                return False
-        else:
-            return True
+        return all(itertools.imap(lambda output: output.exists(), outputs))
+
+    @classmethod
+    def bulk_complete(cls, parameter_tuples):
+        """Returns those of parameter_tuples for which this Task is complete.
+
+        Override (with an efficient implementation) for efficient scheduling
+        with range tools. Keep the logic consistent with that of complete().
+        """
+        raise NotImplementedError
 
     def output(self):
         """The output that this Task produces.
@@ -457,6 +511,14 @@ class Task(object):
         '''
         return flatten(self.requires())  # base impl
 
+    def process_resources(self):
+        '''
+        Override in "template" tasks which provide common resource functionality
+        but allow subclasses to specify additional resources while preserving
+        the name for consistent end-user experience.
+        '''
+        return self.resources  # default impl
+
     def input(self):
         """Returns the outputs of the Tasks returned by :py:meth:`requires`
 
@@ -495,12 +557,13 @@ class Task(object):
         This method gets called when :py:meth:`run` completes without raising any exceptions.
         The returned value is json encoded and sent to the scheduler as the `expl` argument.
         Default behavior is to send an None value"""
+        pass
 
 
 def externalize(task):
     """Returns an externalized version of the Task.
 
-    See py:class:`ExternalTask`.
+    See :py:class:`ExternalTask`.
     """
     task.run = NotImplemented
     return task
@@ -574,3 +637,15 @@ def flatten(struct):
         pass
 
     return [struct]
+
+
+def flatten_output(task):
+    """Lists all output targets by recursively walking output-less (wrapper) tasks.
+
+    FIXME order consistently.
+    """
+    r = flatten(task.output())
+    if not r:
+        for dep in flatten(task.requires()):
+            r += flatten_output(dep)
+    return r
