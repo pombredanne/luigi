@@ -4,11 +4,19 @@ Graph = (function() {
         "RUNNING":"#0044DD",
         "PENDING":"#EEBB00",
         "DONE":"#00DD00",
-        "DISABLED":"#808080"
-    };
+        "DISABLED":"#808080",
+        "UNKNOWN":"#000000",
+        "TRUNCATED":"#FF00FF"
+    }
 
     /* Line height for items in task status legend */
     var legendLineHeight = 20;
+
+    /* Height of vertical space between nodes */
+    var nodeHeight = 10;
+
+    /* Amount of horizontal space given for each node */
+    var nodeWidth = 200;
 
     /* Calculate minimum SVG height required for legend */
     var legendMaxY = (function () {
@@ -58,36 +66,58 @@ Graph = (function() {
     /* Compute the maximum depth of each node for layout purposes, returns the number
        of nodes at each depth level (for layout purposes) */
     function computeDepth(nodes, nodeIndex) {
-        var rowSizes = [];
         function descend(n, depth) {
-            n.depth = depth;
+            if (n.depth === undefined || depth > n.depth) {
+                n.depth = depth;
+                $.each(n.deps, function(i, dep) {
+                    if (nodeIndex[dep]) {
+                        descend(nodes[nodeIndex[dep]], depth + 1);
+                    }
+                });
+            }
+        }
+        descend(nodes[0], 0);
+
+        var rowSizes = [];
+        function placeNodes(n, depth) {
             if (rowSizes[depth] === undefined) {
                 rowSizes[depth] = 0;
             }
-            n.xOrder = rowSizes[depth];
-            rowSizes[depth]++;
-            $.each(n.deps, function(i, dep) {
-                if (nodeIndex[dep]) {
-                    descend(nodes[nodeIndex[dep]], depth + 1);
-                }
-            });
+            if (n.xOrder === undefined && depth === n.depth) {
+                n.xOrder = rowSizes[depth];
+                rowSizes[depth]++;
+                $.each(n.deps, function(i, dep) {
+                    if (nodeIndex[dep]) {
+                        placeNodes(nodes[nodeIndex[dep]], depth + 1);
+                    }
+                });
+            }
         }
-        descend(nodes[0], 0);
+        placeNodes(nodes[0], 0);
+
         return rowSizes;
     }
 
     /* Format nodes according to their depth and horizontal sort order.
        Algorithm: evenly distribute nodes along each depth level, offsetting each
-       by the text line height to prevent overlapping text. The height of each
-       depth level is therefore determined by the number of nodes at that depth. */
+       by the text line height to prevent overlapping text. This is done within
+       multiple columns to keep the levels from being too tall. The column width
+       is at least nodeWidth to ensure readability. The height of each level is
+       determined by number of nodes divided by number of columns, rounded up. */
     function layoutNodes(nodes, rowSizes) {
+        var numCols = Math.max(2, Math.floor(graphWidth / nodeWidth))
         function rowStartPosition(depth) {
             if (depth === 0) return 20;
-            return rowStartPosition(depth-1)+Math.max(rowSizes[depth-1]*10+10,100);
+            var rowHeight = Math.ceil(rowSizes[depth-1] / numCols);
+            return rowStartPosition(depth-1)+Math.max(rowHeight * nodeHeight + 100);
         }
         $.each(nodes, function(i, node) {
-            node.x = ((node.xOrder+1)/(rowSizes[node.depth]+1))*(graphWidth-200)+100;
-            node.y = rowStartPosition(node.depth) + (node.xOrder*10);
+            var numRows = Math.ceil(rowSizes[node.depth] / numCols);
+            var levelCols = Math.ceil(rowSizes[node.depth] / numRows);
+            var row = node.xOrder % numRows;
+            var col = node.xOrder / numRows;
+            node.x = ((col + 1) / (levelCols + 1)) * (graphWidth - 200);
+            node.y = rowStartPosition(node.depth) + row * nodeHeight;
         });
     }
 
@@ -127,7 +157,7 @@ Graph = (function() {
         };
     }
 
-    var graphWidth = window.innerWidth - 51;
+    var graphWidth = window.innerWidth - 80;
 
     function DependencyGraph(containerElement) {
         this.svg = $(svgElement("svg")).appendTo($(containerElement));
@@ -163,13 +193,6 @@ Graph = (function() {
             var g = $(svgElement("g"))
                 .addClass("node")
                 .attr("transform", "translate(" + node.x + "," + node.y +")")
-                .attr("title", "translate(" + node.x + "," + node.y +")")
-                .tooltip(
-                    {
-                        content: function() {
-                            return $(this).attr('title');
-                        }
-                    })
                 .appendTo(self.svg);
 
             $(svgElement("circle"))
@@ -187,13 +210,16 @@ Graph = (function() {
                 .attr("data-task-id", node.taskId)
                 .appendTo(g);
 
-            var titleText = node.name + '<br/>';
-            $.each(node.params, function (param_name, param_value) {
-                titleText += param_name + "=" + param_value + '<br/>';
-            });
-            titleText += "priority" + "=" + node.priority + '<br/>';
-            g.attr("title", $.trim(titleText))
-                .tooltip();
+            var titleText = node.name;
+            var content = $.map(node.params, function (value, name) { return name + ": " + value; }).join("<br>");
+            g.attr("title", titleText)
+                .popover({
+                    trigger: 'hover',
+                    container: 'body',
+                    html: true,
+                    placement: 'top',
+                    content: content
+                });
         });
 
         // Legend for Task status
@@ -231,6 +257,7 @@ Graph = (function() {
     };
 
     DependencyGraph.prototype.updateData = function(taskList) {
+        $('.popover').popover('destroy');
         this.graph = createGraph(taskList);
         bounds = findBounds(this.graph.nodes);
         this.renderGraph();

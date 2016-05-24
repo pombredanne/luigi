@@ -1,34 +1,51 @@
-# Copyright (c) 2012 Spotify AB
+# -*- coding: utf-8 -*-
 #
-# Licensed under the Apache License, Version 2.0 (the "License"); you may not
-# use this file except in compliance with the License. You may obtain a copy of
-# the License at
+# Copyright 2012-2015 Spotify AB
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# License for the specific language governing permissions and limitations under
-# the License.
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 
-import os
-from luigi.contrib.ftp import RemoteFileSystem, RemoteTarget
+# this is an integration test. to run this test requires that an actuall FTP server
+# is running somewhere. to run a local ftp server do the following
+# pip install pyftpdlib==1.5.0
+# mkdir /tmp/luigi-test-ftp/
+# sudo python -m _test_ftp
 
+
+import datetime
 import ftplib
-import unittest
-from cStringIO import StringIO
+import os
+import shutil
+from helpers import unittest
+try:
+    from cStringIO import StringIO
+except ImportError:
+    from io import StringIO
+
+from luigi.contrib.ftp import RemoteFileSystem, RemoteTarget
 
 # dumb files
 FILE1 = """this is file1"""
 FILE2 = """this is file2"""
 FILE3 = """this is file3"""
 
-HOST = "some_host"
+HOST = "localhost"
 USER = "luigi"
 PWD = "some_password"
 
+
 class TestFTPFilesystem(unittest.TestCase):
+
     def setUp(self):
         """ Creates structure
 
@@ -81,6 +98,7 @@ class TestFTPFilesystem(unittest.TestCase):
 
 
 class TestFTPFilesystemUpload(unittest.TestCase):
+
     def test_single(self):
         """ Test upload file with creation of intermediate folders """
         ftp_path = "/test/nest/luigi-test"
@@ -110,6 +128,7 @@ class TestFTPFilesystemUpload(unittest.TestCase):
 
 
 class TestRemoteTarget(unittest.TestCase):
+
     def test_put(self):
         """ Test RemoteTarget put method with uploading to an FTP """
         local_filepath = "/tmp/luigi-remotetarget-write-test"
@@ -157,8 +176,21 @@ class TestRemoteTarget(unittest.TestCase):
         remotetarget = RemoteTarget(remote_file, HOST, username=USER, password=PWD)
         remotetarget.get(local_filepath)
 
+        # make sure that it can open file
+        with remotetarget.open('r') as fin:
+            self.assertEqual(fin.read(), "something to fill")
+
         # file is successfuly created
         self.assertTrue(os.path.exists(local_filepath))
+
+        # test RemoteTarget with mtime
+        ts = datetime.datetime.now() - datetime.timedelta(minutes=2)
+        delayed_remotetarget = RemoteTarget(remote_file, HOST, username=USER, password=PWD, mtime=ts)
+        self.assertTrue(delayed_remotetarget.exists())
+
+        ts = datetime.datetime.now() + datetime.timedelta(days=2)  # who knows what timezone it is in
+        delayed_remotetarget = RemoteTarget(remote_file, HOST, username=USER, password=PWD, mtime=ts)
+        self.assertFalse(delayed_remotetarget.exists())
 
         # clean
         os.remove(local_filepath)
@@ -168,3 +200,27 @@ class TestRemoteTarget(unittest.TestCase):
         ftp.cwd("/")
         ftp.rmd("test")
         ftp.close()
+
+
+def _run_ftp_server():
+    from pyftpdlib.authorizers import DummyAuthorizer
+    from pyftpdlib.handlers import FTPHandler
+    from pyftpdlib.servers import FTPServer
+
+    # Instantiate a dummy authorizer for managing 'virtual' users
+    authorizer = DummyAuthorizer()
+
+    tmp_folder = '/tmp/luigi-test-ftp-server/'
+    if os.path.exists(tmp_folder):
+        shutil.rmtree(tmp_folder)
+    os.mkdir(tmp_folder)
+
+    authorizer.add_user(USER, PWD, tmp_folder, perm='elradfmwM')
+    handler = FTPHandler
+    handler.authorizer = authorizer
+    address = ('localhost', 21)
+    server = FTPServer(address, handler)
+    server.serve_forever()
+
+if __name__ == '__main__':
+    _run_ftp_server()

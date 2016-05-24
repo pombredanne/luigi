@@ -13,18 +13,15 @@
 # the License.
 
 import os
-import sys
 
-try:
-    from setuptools import setup
-except:
-    from distutils.core import setup
+from setuptools import setup
 
 
 def get_static_files(path):
-    return [os.path.join(dirpath.replace("luigi/", ""), ext) 
+    return [os.path.join(dirpath.replace("luigi/", ""), ext)
             for (dirpath, dirnames, filenames) in os.walk(path)
-            for ext in ["*.html", "*.js", "*.css", "*.png"]]
+            for ext in ["*.html", "*.js", "*.css", "*.png",
+                        "*.eot", "*.svg", "*.ttf", "*.woff", "*.woff2"]]
 
 
 luigi_package_data = sum(map(get_static_files, ["luigi/static", "luigi/templates"]), [])
@@ -40,34 +37,54 @@ with open('README.rst') as fobj:
     long_description = readme_note + fobj.read()
 
 install_requires = [
-    'pyparsing',
-    'tornado',
-    'snakebite>=2.4.10',
+    'tornado>=4.0,<5',
+    'python-daemon<3.0',
 ]
 
-if sys.version_info[:2] < (2, 7):
-    install_requires.extend(['argparse', 'ordereddict'])
+if os.environ.get('READTHEDOCS', None) == 'True':
+    # So that we can build documentation for luigi.db_task_history and luigi.contrib.sqla
+    install_requires.append('sqlalchemy')
+    # readthedocs don't like python-daemon, see #1342
+    install_requires.remove('python-daemon<3.0')
 
 setup(
     name='luigi',
-    version='1.0.19',
+    version='2.1.1',
     description='Workflow mgmgt + task scheduling + dependency resolution',
     long_description=long_description,
     author='Erik Bernhardsson',
-    author_email='erikbern@spotify.com',
     url='https://github.com/spotify/luigi',
     license='Apache License 2.0',
     packages=[
         'luigi',
         'luigi.contrib',
+        'luigi.contrib.hdfs',
         'luigi.tools'
     ],
     package_data={
         'luigi': luigi_package_data
     },
-    scripts=[
-        'bin/luigid',
-        'bin/luigi'
-    ],
+    entry_points={
+        'console_scripts': [
+            'luigi = luigi.cmdline:luigi_run',
+            'luigid = luigi.cmdline:luigid',
+            'luigi-grep = luigi.tools.luigi_grep:main',
+            'luigi-deps = luigi.tools.deps:main',
+            'luigi-migrate = luigi.tools.migrate:main'
+        ]
+    },
     install_requires=install_requires,
+    classifiers=[
+        'Development Status :: 5 - Production/Stable',
+        'Environment :: Console',
+        'Environment :: Web Environment',
+        'Intended Audience :: Developers',
+        'Intended Audience :: System Administrators',
+        'License :: OSI Approved :: Apache Software License',
+        'Programming Language :: Python :: 2.7',
+        'Programming Language :: Python :: 3.3',
+        'Programming Language :: Python :: 3.4',
+        'Programming Language :: Python :: 3.5',
+        'Topic :: System :: Monitoring',
+    ],
 )
