@@ -40,8 +40,8 @@
 from __future__ import print_function
 import luigi.interface
 from luigi.contrib.ssh import RemoteTarget
-from luigi.postgres import PostgresTarget
-from luigi.s3 import S3Target
+from luigi.contrib.postgres import PostgresTarget
+from luigi.contrib.s3 import S3Target
 from luigi.target import FileSystemTarget
 from luigi.task import flatten
 from luigi import parameter
@@ -69,7 +69,7 @@ class upstream(luigi.task.Config):
     '''
     Used to provide the parameter upstream-family
     '''
-    family = parameter.Parameter(default=None)
+    family = parameter.OptionalParameter(default=None)
 
 
 def find_deps(task, upstream_task_family):
@@ -79,7 +79,7 @@ def find_deps(task, upstream_task_family):
 
     Returns all deps on all paths between task and upstream
     '''
-    return set([t for t in dfs_paths(task, upstream_task_family)])
+    return {t for t in dfs_paths(task, upstream_task_family)}
 
 
 def find_deps_cli():
@@ -117,7 +117,7 @@ def main():
         task_output = task.output()
 
         if isinstance(task_output, dict):
-            output_descriptions = [get_task_output_description(output) for label, output in task_output.iteritems()]
+            output_descriptions = [get_task_output_description(output) for label, output in task_output.items()]
         elif isinstance(task_output, collections.Iterable):
             output_descriptions = [get_task_output_description(output) for output in task_output]
         else:

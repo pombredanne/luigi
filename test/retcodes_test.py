@@ -54,7 +54,7 @@ class RetcodesTest(LuigiTestCase):
             def run(self):
                 pass
 
-        old_func = luigi.scheduler.CentralPlannerScheduler.get_work
+        old_func = luigi.scheduler.Scheduler.get_work
 
         def new_func(*args, **kwargs):
             kwargs['current_tasks'] = None
@@ -63,7 +63,7 @@ class RetcodesTest(LuigiTestCase):
             res['running_tasks'][0]['worker'] = "not me :)"  # Otherwise it will be filtered
             return res
 
-        with mock.patch('luigi.scheduler.CentralPlannerScheduler.get_work', new_func):
+        with mock.patch('luigi.scheduler.Scheduler.get_work', new_func):
             self.run_and_expect('AlreadyRunningTask', 0)  # Test default value to be 0
             self.run_and_expect('AlreadyRunningTask --retcode-already-running 5', 5)
             self.run_with_config(dict(already_running='3'), 'AlreadyRunningTask', 3)
@@ -106,6 +106,22 @@ class RetcodesTest(LuigiTestCase):
 
         self.run_and_expect('RequiringTask', 4)
 
+    def test_task_limit(self):
+        class TaskB(luigi.Task):
+            def complete(self):
+                return False
+
+        class TaskA(luigi.Task):
+            def requires(sefl):
+                yield TaskB()
+
+        class TaskLimitTest(luigi.Task):
+            def requires(self):
+                yield TaskA()
+
+        self.run_and_expect('TaskLimitTest --worker-task-limit 2', 0)
+        self.run_and_expect('TaskLimitTest --worker-task-limit 2 --retcode-scheduling-error 3', 3)
+
     def test_unhandled_exception(self):
         def new_func(*args, **kwargs):
             raise Exception()
@@ -137,3 +153,39 @@ class RetcodesTest(LuigiTestCase):
 
         self.run_and_expect('RequiringTask --retcode-task-failed 4 --retcode-missing-data 5', 5)
         self.run_and_expect('RequiringTask --retcode-task-failed 7 --retcode-missing-data 6', 7)
+
+    def test_unknown_reason(self):
+
+        class TaskA(luigi.Task):
+            def complete(self):
+                return True
+
+        class RequiringTask(luigi.Task):
+            def requires(self):
+                yield TaskA()
+
+        def new_func(*args, **kwargs):
+            return None
+
+        with mock.patch('luigi.scheduler.Scheduler.add_task', new_func):
+            self.run_and_expect('RequiringTask', 0)
+            self.run_and_expect('RequiringTask --retcode-not-run 5', 5)
+
+    """
+    Test that a task once crashing and then succeeding should be counted as no failure.
+    """
+    def test_retry_sucess_task(self):
+        class Foo(luigi.Task):
+            run_count = 0
+
+            def run(self):
+                self.run_count += 1
+                if self.run_count == 1:
+                    raise ValueError()
+
+            def complete(self):
+                return self.run_count > 0
+
+        self.run_and_expect('Foo --scheduler-retry-delay=0', 0)
+        self.run_and_expect('Foo --scheduler-retry-delay=0 --retcode-task-failed=5', 0)
+        self.run_with_config(dict(task_failed='3'), 'Foo', 0)

@@ -51,8 +51,8 @@ import luigi
 import luigi.task
 import luigi.contrib.gcs
 import luigi.contrib.hdfs
-import luigi.s3
-from luigi import mrrunner
+import luigi.contrib.s3
+from luigi.contrib import mrrunner
 
 if six.PY2:
     from itertools import imap as map
@@ -72,10 +72,13 @@ TRACKING_RE = re.compile(r'(tracking url|the url to track the job):\s+(?P<url>.+
 
 
 class hadoop(luigi.task.Config):
-    pool = luigi.Parameter(default=None,
-                           description='Hadoop pool so use for Hadoop tasks. '
-                           'To specify pools per tasks, see '
-                           'BaseHadoopJobTask.pool')
+    pool = luigi.OptionalParameter(
+        default=None,
+        description=(
+            'Hadoop pool so use for Hadoop tasks. To specify pools per tasks, '
+            'see BaseHadoopJobTask.pool'
+        ),
+    )
 
 
 def attach(*packages):
@@ -450,15 +453,17 @@ class HadoopJobRunner(JobRunner):
         # build arguments
         config = configuration.get_config()
         python_executable = config.get('hadoop', 'python-executable', 'python')
-        map_cmd = '{0} mrrunner.py map'.format(python_executable)
-        cmb_cmd = '{0} mrrunner.py combiner'.format(python_executable)
-        red_cmd = '{0} mrrunner.py reduce'.format(python_executable)
+        runner_arg = 'mrrunner.pex' if job.package_binary is not None else 'mrrunner.py'
+        command = '{0} {1} {{step}}'.format(python_executable, runner_arg)
+        map_cmd = command.format(step='map')
+        cmb_cmd = command.format(step='combiner')
+        red_cmd = command.format(step='reduce')
 
         output_final = job.output().path
         # atomic output: replace output with a temporary work directory
         if self.end_job_with_atomic_move_dir:
             illegal_targets = (
-                luigi.s3.S3FlagTarget, luigi.contrib.gcs.GCSFlagTarget)
+                luigi.contrib.s3.S3FlagTarget, luigi.contrib.gcs.GCSFlagTarget)
             if isinstance(job.output(), illegal_targets):
                 raise TypeError("end_job_with_atomic_move_dir is not supported"
                                 " for {}".format(illegal_targets))
@@ -483,8 +488,17 @@ class HadoopJobRunner(JobRunner):
             arglist += ['-libjars', ','.join(libjars)]
 
         # 'archives' is also a generic option
+        archives = []
+        extra_archives = job.extra_archives()
+
         if self.archives:
-            arglist += ['-archives', ','.join(self.archives)]
+            archives = self.archives
+
+        if extra_archives:
+            archives += extra_archives
+
+        if archives:
+            arglist += ['-archives', ','.join(archives)]
 
         # Add static files and directories
         extra_files = get_extra_files(job.extra_files())
@@ -509,14 +523,27 @@ class HadoopJobRunner(JobRunner):
 
         arglist += self.streaming_args
 
+        # Add additonal non-generic  per-job streaming args
+        extra_streaming_args = job.extra_streaming_arguments()
+        for (arg, value) in extra_streaming_args:
+            if not arg.startswith('-'):  # safety first
+                arg = '-' + arg
+            arglist += [arg, value]
+
         arglist += ['-mapper', map_cmd]
+
         if job.combiner != NotImplemented:
             arglist += ['-combiner', cmb_cmd]
         if job.reducer != NotImplemented:
             arglist += ['-reducer', red_cmd]
-        files = [runner_path, self.tmp_dir + '/packages.tar', self.tmp_dir + '/job-instance.pickle']
+        packages_fn = 'mrrunner.pex' if job.package_binary is not None else 'packages.tar'
+        files = [
+            runner_path if job.package_binary is None else None,
+            os.path.join(self.tmp_dir, packages_fn),
+            os.path.join(self.tmp_dir, 'job-instance.pickle'),
+        ]
 
-        for f in files:
+        for f in filter(None, files):
             arglist += ['-file', f]
 
         if self.output_format:
@@ -526,7 +553,7 @@ class HadoopJobRunner(JobRunner):
 
         allowed_input_targets = (
             luigi.contrib.hdfs.HdfsTarget,
-            luigi.s3.S3Target,
+            luigi.contrib.s3.S3Target,
             luigi.contrib.gcs.GCSTarget)
         for target in luigi.task.flatten(job.input_hadoop()):
             if not isinstance(target, allowed_input_targets):
@@ -536,7 +563,7 @@ class HadoopJobRunner(JobRunner):
 
         allowed_output_targets = (
             luigi.contrib.hdfs.HdfsTarget,
-            luigi.s3.S3FlagTarget,
+            luigi.contrib.s3.S3FlagTarget,
             luigi.contrib.gcs.GCSFlagTarget)
         if not isinstance(job.output(), allowed_output_targets):
             raise TypeError('output must be one of: {}'.format(
@@ -544,7 +571,10 @@ class HadoopJobRunner(JobRunner):
         arglist += ['-output', output_hadoop]
 
         # submit job
-        create_packages_archive(packages, self.tmp_dir + '/packages.tar')
+        if job.package_binary is not None:
+            shutil.copy(job.package_binary, os.path.join(self.tmp_dir, 'mrrunner.pex'))
+        else:
+            create_packages_archive(packages, os.path.join(self.tmp_dir, 'packages.tar'))
 
         job.dump(self.tmp_dir)
 
@@ -641,7 +671,7 @@ class LocalJobRunner(JobRunner):
 
 
 class BaseHadoopJobTask(luigi.Task):
-    pool = luigi.Parameter(default=None, significant=False, positional=False)
+    pool = luigi.OptionalParameter(default=None, significant=False, positional=False)
     # This value can be set to change the default batching increment. Default is 1 for backwards compatibility.
     batch_counter_default = 1
 
@@ -650,6 +680,7 @@ class BaseHadoopJobTask(luigi.Task):
     final_reducer = NotImplemented
 
     mr_priority = NotImplemented
+    package_binary = None
 
     _counter_dict = {}
     task_id = None
@@ -667,7 +698,7 @@ class BaseHadoopJobTask(luigi.Task):
 
     def jobconfs(self):
         jcs = []
-        jcs.append('mapred.job.name=%s' % self.task_id)
+        jcs.append('mapred.job.name=%s' % self)
         if self.mr_priority != NotImplemented:
             jcs.append('mapred.job.priority=%s' % self.mr_priority())
         pool = self._get_pool()
@@ -753,6 +784,7 @@ DataInterchange = {
 
 
 class JobTask(BaseHadoopJobTask):
+    jobconf_truncate = 20000
     n_reduce_tasks = 25
     reducer = NotImplemented
 
@@ -762,6 +794,8 @@ class JobTask(BaseHadoopJobTask):
             jcs.append('mapred.reduce.tasks=0')
         else:
             jcs.append('mapred.reduce.tasks=%s' % self.n_reduce_tasks)
+        if self.jobconf_truncate >= 0:
+            jcs.append('stream.jobconf.truncate.limit=%i' % self.jobconf_truncate)
         return jcs
 
     def init_mapper(self):
@@ -819,7 +853,7 @@ class JobTask(BaseHadoopJobTask):
                     # JSON is already serialized, so we put `self.serialize` in a else statement.
                     output = map(self.serialize, output)
                 print("\t".join(output), file=stdout)
-            except:
+            except BaseException:
                 print(output, file=stderr)
                 raise
 
@@ -899,6 +933,17 @@ class JobTask(BaseHadoopJobTask):
         """
         return []
 
+    def extra_streaming_arguments(self):
+        """
+        Extra arguments to Hadoop command line.
+        Return here a list of (parameter, value) tuples.
+        """
+        return []
+
+    def extra_archives(self):
+        """List of paths to archives """
+        return []
+
     def add_link(self, src, dst):
         if not hasattr(self, '_links'):
             self._links = []
@@ -930,23 +975,16 @@ class JobTask(BaseHadoopJobTask):
         """
         Dump instance to file.
         """
-        _set_tracking_url = self.set_tracking_url
-        self.set_tracking_url = None
-        _set_status_message = self.set_status_message
-        self.set_status_message = None
+        with self.no_unpicklable_properties():
+            file_name = os.path.join(directory, 'job-instance.pickle')
+            if self.__module__ == '__main__':
+                d = pickle.dumps(self)
+                module_name = os.path.basename(sys.argv[0]).rsplit('.', 1)[0]
+                d = d.replace(b'(c__main__', "(c" + module_name)
+                open(file_name, "wb").write(d)
 
-        file_name = os.path.join(directory, 'job-instance.pickle')
-        if self.__module__ == '__main__':
-            d = pickle.dumps(self)
-            module_name = os.path.basename(sys.argv[0]).rsplit('.', 1)[0]
-            d = d.replace(b'(c__main__', "(c" + module_name)
-            open(file_name, "wb").write(d)
-
-        else:
-            pickle.dump(self, open(file_name, "wb"))
-
-        self.set_tracking_url = _set_tracking_url
-        self.set_status_message = _set_status_message
+            else:
+                pickle.dump(self, open(file_name, "wb"))
 
     def _map_input(self, input_stream):
         """
